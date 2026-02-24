@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>MLCBot Sidebar</title>
+    <link rel="stylesheet" href="sidebar.css" />
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"
+    />
+  </head>
+  <body>
+    <!-- Main Chat Page -->
+    <div id="chat-page">
+    <div id="loadingContainer"></div>
+
+    <div class="header-row">
+      <span id="current-model-display" class="model-display"></span>
+      <button id="settings-button" class="btn settings-btn" title="Settings">
+        <i class="fa fa-cog"></i>
+      </button>
+    </div>
+
+    <div class="input-container form-group">
+      <input
+        type="search"
+        id="query-input"
+        placeholder="What's on your mind?"
+      />
+      <button id="submit-button" class="btn">
+        <i class="fa fa-comments"></i>
+      </button>
+    </div>
+
+    <div class="stage">
+      <div id="loading-indicator" class="dot-flashing"></div>
+    </div>
+
+    <div id="answerWrapper">
+      <div id="answer"></div>
+      <div class="copyRow">
+        <span id="timestamp"></span>
+        <button
+          id="copyAnswer"
+          class="btn copyButton"
+          title="Copy the Answer to the Clipboard"
+        >
+          <i class="fa-solid fa-copy fa-lg"></i>
+        </button>
+      </div>
+    </div>
+    </div>
+
+    <!-- Settings Page -->
+    <div id="settings-page" style="display: none;">
+      <div class="settings-header">
+        <button id="back-button" class="btn back-btn" title="Back">
+          <i class="fa fa-arrow-left"></i>
+        </button>
+        <h3>Settings</h3>
+      </div>
+
+      <div class="settings-content">
+        <label for="model-select">Select Model:</label>
+        <select id="model-select" class="model-select"></select>
+        
+        <div id="model-info" class="model-info"></div>
+        
+        <button id="save-settings" class="btn save-btn">Save & Apply</button>
+        
+        <div id="settings-status" class="settings-status"></div>
+      </div>
+    </div>
+
+    <script type="module" src="./sidebar.ts"></script>
+  </body>
+</html>
