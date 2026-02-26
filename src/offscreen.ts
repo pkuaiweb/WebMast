@@ -26,7 +26,7 @@ const activeRequests = new Map<string, { aborted: boolean }>();
 
 // ==================== 引擎初始化 ====================
 
-async function initEngine(modelId: string = "Llama-3.2-1B-Instruct-q4f16_1-MLC") {
+async function initEngine(modelId: string) {
   // If same model is already initialized, return ready
   if (engine && currentModelId === modelId && engineReady) {
     console.log("[Offscreen] Engine already initialized with model:", modelId);
@@ -346,7 +346,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   switch (message.type) {
     case "INIT_ENGINE":
-      initEngine(message.data?.modelId).then(sendResponse);
+      if (!message.data?.modelId) {
+        sendResponse({ status: "error", error: "modelId is required" });
+        return true;
+      }
+      initEngine(message.data.modelId).then(sendResponse);
       return true;
 
     case "CHAT_COMPLETION":
