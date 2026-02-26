@@ -47,7 +47,7 @@ interface EngineInitResult {
 
 const SUMMARY_CACHE_PREFIX = "page_summary_";
 const PENDING_CACHE_PREFIX = "pending_page_";
-const DEFAULT_MODEL_ID = "Qwen3-1.7B-q4f16_1" //"Llama-3.2-1B-Instruct-q4f16_1-MLC"// "Llama-3.2-3B-Instruct-q4f32_1-MLC";
+const DEFAULT_MODEL_ID = "Qwen3-1.7B-q4f16_1-MLC" //"Llama-3.2-1B-Instruct-q4f16_1-MLC"// "Llama-3.2-3B-Instruct-q4f32_1-MLC";
 const MODEL_STORAGE_KEY = "selected_model_id";
 
 let currentModelId = DEFAULT_MODEL_ID;
@@ -156,6 +156,9 @@ async function initializeEngine(forceModelId?: string): Promise<EngineInitResult
         resolve({ status: "ready", modelId });
       } else if (response?.status === "initializing") {
         resolve({ status: "initializing", modelId });
+      } else if (response?.status === "error") {
+        console.error("[Background] Init engine returned error:", response.error);
+        resolve({ status: "error", modelId, error: response.error || "Unknown engine error" });
       } else {
         resolve({ status: "error", modelId, error: "Unknown response from offscreen" });
       }
@@ -224,6 +227,7 @@ interface MultiTabQueryResult {
 
 // 解析摘要响应 - 处理各种格式变体
 function parseSummaryResponse(response: string): { sufficient: boolean; answer: string } {
+  console.log("[Background] Parsing summary response:", response);
   const normalized = response.toLowerCase();
   
   // 检查 SUFFICIENT - 支持多种格式
@@ -452,9 +456,18 @@ async function processSummarizationQueue() {
         });
         await removePendingPage(url);
         console.log("[Background] Summary saved:", pageData.title);
+      } else if (response?.error) {
+        console.error("[Background] Summarization error for", pageData.title, ":", response.error);
+        // 清理 pending 数据，避免残留
+        await removePendingPage(url);
+      } else {
+        console.warn("[Background] Summarization returned unexpected response for", pageData.title, ":", response);
+        await removePendingPage(url);
       }
     } catch (err) {
       console.error("[Background] Summarization failed:", err);
+      // Promise reject 场景（如 chrome.runtime.lastError），也清理 pending
+      await removePendingPage(url);
     }
   }
 
@@ -671,6 +684,10 @@ chrome.runtime.onConnect.addListener((port) => {
         }, (response) => {
           if (chrome.runtime.lastError) {
             port.postMessage({ type: "error", error: chrome.runtime.lastError.message });
+            streamPorts.delete(requestId);
+          } else if (response?.error) {
+            console.error("[Background] Stream start error:", response.error);
+            port.postMessage({ type: "error", error: response.error });
             streamPorts.delete(requestId);
           }
         });
