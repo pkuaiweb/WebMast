@@ -151,15 +151,23 @@ async function initializeEngine(forceModelId?: string): Promise<EngineInitResult
     }, (response) => {
       if (chrome.runtime.lastError) {
         console.error("[Background] Init engine error:", chrome.runtime.lastError);
+        isEngineInitializing = false;
         resolve({ status: "error", modelId, error: chrome.runtime.lastError.message });
       } else if (response?.status === "ready") {
+        // 同步更新本地状态（应对 background 重启后 offscreen 已就绪的场景）
+        offscreenEngineReady = true;
+        engineInitProgress = 1;
+        isEngineInitializing = false;
+        currentModelId = modelId;
         resolve({ status: "ready", modelId });
       } else if (response?.status === "initializing") {
         resolve({ status: "initializing", modelId });
       } else if (response?.status === "error") {
         console.error("[Background] Init engine returned error:", response.error);
+        isEngineInitializing = false;
         resolve({ status: "error", modelId, error: response.error || "Unknown engine error" });
       } else {
+        isEngineInitializing = false;
         resolve({ status: "error", modelId, error: "Unknown response from offscreen" });
       }
     });
@@ -722,10 +730,23 @@ loadModelIdFromStorage().then(savedModelId => {
   console.log("[Background] Loaded model ID from storage:", currentModelId);
   
   ensureOffscreenDocument().then(() => {
-    console.log("[Background] Offscreen document ready, starting engine initialization...");
-    // 启动时就开始加载模型，不等 popup 触发
-    initializeEngine().then(result => {
-      console.log("[Background] Initial engine load result:", result.status);
+    console.log("[Background] Offscreen document ready, checking engine status...");
+    
+    // 先查询 offscreen 当前状态（应对 background 重启但 offscreen 仍运行的场景）
+    chrome.runtime.sendMessage({ type: "CHECK_ENGINE_STATUS" }, (statusResponse) => {
+      if (!chrome.runtime.lastError && statusResponse?.ready && statusResponse?.modelId === currentModelId) {
+        // offscreen 引擎已就绪，直接同步状态，无需重新加载
+        offscreenEngineReady = true;
+        engineInitProgress = 1;
+        isEngineInitializing = false;
+        console.log("[Background] Engine already ready in offscreen, state recovered.");
+        processSummarizationQueue();
+      } else {
+        // offscreen 引擎未就绪，正常初始化
+        initializeEngine().then(result => {
+          console.log("[Background] Initial engine load result:", result.status);
+        });
+      }
     });
   });
 });
