@@ -362,6 +362,12 @@ async function handleClick() {
   document.getElementById("loading-indicator")!.style.display = "block";
 
   try {
+    // 每次提交时重新获取最新的页面内容和缓存摘要
+    if (useContext) {
+      allTabContents = await fetchPageContents();
+      console.log(`[Sidebar] Fetched ${allTabContents.length} tabs`);
+    }
+
     // 调用 Background 处理多标签页查询逻辑
     const result = await processMultiTabQueryViaBackground(allTabContents, message);
     
@@ -464,28 +470,35 @@ async function getAllCachedSummaries(): Promise<{ [url: string]: CachedSummaryDa
   });
 }
 
-function fetchPageContents() {
-  chrome.tabs.query({ currentWindow: true }, async (tabs) => {
-    if (tabs.length === 0) {
-      console.warn("[Sidebar] No tabs found");
-      return;
-    }
+async function fetchPageContents(): Promise<TabContent[]> {
+  const tabs = await chrome.tabs.query({ currentWindow: true });
+  if (tabs.length === 0) {
+    console.warn("[Sidebar] No tabs found");
+    return [];
+  }
 
-    // 获取所有缓存摘要
-    const cachedSummaries = await getAllCachedSummaries();
-    console.log(`[Sidebar] Found ${Object.keys(cachedSummaries).length} cached summaries`);
+  const results: TabContent[] = [];
+  const promises: Promise<void>[] = [];
 
-    tabs.forEach((tab) => {
-      if (tab.id) {
+  for (const tab of tabs) {
+    if (!tab.id) continue;
+    promises.push(
+      new Promise<void>((resolve) => {
         try {
-          const port = chrome.tabs.connect(tab.id, { name: "channelName" });
+          const port = chrome.tabs.connect(tab.id!, { name: "channelName" });
           port.postMessage({});
-          
-          port.onMessage.addListener((msg) => {
+
+          const timeout = setTimeout(() => {
+            port.disconnect();
+            resolve();
+          }, 3000);
+
+          port.onMessage.addListener(async (msg) => {
+            clearTimeout(timeout);
             const tabUrl = tab.url || "Unknown URL";
-            const cachedSummary = cachedSummaries[tabUrl];
-            
-            allTabContents.push({
+            const cachedSummary = await getCachedSummary(tabUrl);
+
+            results.push({
               title: tab.title || "Untitled",
               url: tabUrl,
               content: msg.contents,
@@ -493,20 +506,27 @@ function fetchPageContents() {
               hasCachedSummary: !!cachedSummary
             });
 
-            console.log(`[Sidebar] Tab loaded: ${tab.title}, has cached summary: ${!!cachedSummary},cached summaries: ${cachedSummary?.summary}`);
+            console.log(`[Sidebar] Tab loaded: ${tab.title}, has cached summary: ${!!cachedSummary}`);
+            resolve();
           });
 
           port.onDisconnect.addListener(() => {
+            clearTimeout(timeout);
             if (chrome.runtime.lastError) {
               console.warn(`[Sidebar] Could not connect to tab ${tab.id}: ${chrome.runtime.lastError.message}`);
             }
+            resolve();
           });
         } catch (error) {
           console.warn(`[Sidebar] Failed to connect to tab ${tab.id}:`, error);
+          resolve();
         }
-      }
-    });
-  });
+      })
+    );
+  }
+
+  await Promise.all(promises);
+  return results;
 }
 
 // ==================== 初始化 ====================
@@ -514,11 +534,6 @@ function fetchPageContents() {
 async function init() {
   console.log("[Sidebar] Initializing...");
   
-  // 获取页面内容
-  if (useContext) {
-    fetchPageContents();
-  }
-
   // 等待引擎就绪
   try {
     await waitForEngineReady();
