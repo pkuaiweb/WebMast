@@ -233,29 +233,32 @@ interface MultiTabQueryResult {
   error?: string;
 }
 
-// 解析摘要响应 - 处理各种格式变体
+// 解析摘要响应 - 三种情况：
+// 1. sufficient:yes + answer -> 摘要足够，直接使用答案
+// 2. sufficient:no          -> 摘要相关但信息不足，回退到原始内容
+// 3. sufficient:yes + N/A   -> 摘要与问题无关，标记为不相关（跳过原始内容）
 function parseSummaryResponse(response: string): { sufficient: boolean; answer: string } {
   console.log("[Background] Parsing summary response:", response);
   const normalized = response.toLowerCase();
   
-  // 检查 SUFFICIENT - 支持多种格式
+  // 检查 SUFFICIENT 字段
   const sufficientMatch = normalized.match(/\*{0,2}sufficient\*{0,2}:\s*(yes|no)/i);
-  const hasSufficient = sufficientMatch !== null;
-  const isSufficient = sufficientMatch ? sufficientMatch[1] === "yes" : false;
+  const isSufficient = sufficientMatch ? sufficientMatch[1].toLowerCase() === "yes" : false;
+  // 提取 ANSWER 字段
+  const answerMatch = response.match(/\*{0,2}answer\*{0,2}:\s*([\s\S]*)/i);  
   
-  // 提取 ANSWER
-  const answerMatch = response.match(/\*{0,2}answer\*{0,2}:\s*([\s\S]*)/i);
-  let answer = "";
-  
-  if (answerMatch) {
-    answer = answerMatch[1].trim();
-    answer = answer.replace(/^\*+|\*+$/g, "").trim();
-  } else if (!hasSufficient) {
-    answer = response.trim();
-    return { sufficient: true, answer };
+  if (!sufficientMatch || !answerMatch) {
+    // 模型未遵循格式，将整个响应作为答案
+    return { sufficient: true, answer: response.trim() };
   }
-  
-  return { sufficient: isSufficient, answer };
+  // sufficient:no -> 相关但不足，回退原始内容，无需 ANSWER
+  if (!isSufficient) {
+    return { sufficient: false, answer: "" };
+  }
+    let answer = answerMatch[1].trim();
+    // 去除多余的星号（模型可能忽略格式要求）
+    answer = answer.replace(/^\*+|\*+$/g, "").trim();
+    return { sufficient: isSufficient, answer };
 }
 
 // 调用 offscreen 进行静默 chat（中间处理，不更新 UI）
@@ -344,7 +347,22 @@ async function processMultiTabQuery(
       const summaryMessages = [
         {
           role: "system",
-          content: "Answer the question based on the summary. You MUST use this EXACT format (no markdown, no asterisks):\nSUFFICIENT: yes\nANSWER: your answer\n\nOR if info not found:\nSUFFICIENT: no\nANSWER: N/A\n\nBe concise. No extra text."
+          content: [
+            "You are evaluating whether a page summary contains enough information to answer a question.",
+            "",
+            "You MUST follow one of these three response formats exactly (no markdown, no asterisks, no extra text):",
+            "",
+            "Case 1 – Summary is sufficient to answer the question:",
+            "SUFFICIENT: yes",
+            "ANSWER: <your concise answer>",
+            "",
+            "Case 2 – Summary is relevant to the question but lacks enough detail:",
+            "SUFFICIENT: no",
+            "",
+            "Case 3 – Summary is completely unrelated to the question:",
+            "SUFFICIENT: yes",
+            "ANSWER: N/A"
+          ].join("\n")
         },
         {
           role: "user",
