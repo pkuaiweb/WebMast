@@ -99,6 +99,45 @@ let isLoadingParams = true;
 let allTabContents: TabContent[] = [];
 let currentModelId = "";
 
+// ==================== 计时器 ====================
+
+let timerInterval: ReturnType<typeof setInterval> | null = null;
+let timerStartTime = 0;
+let timerFrozen = false;
+
+function startTimer() {
+  // 清理旧计时器
+  if (timerInterval !== null) {
+    clearInterval(timerInterval);
+    timerInterval = null;
+  }
+  timerFrozen = false;
+  timerStartTime = Date.now();
+  const el = document.getElementById("elapsed-timer");
+  if (el) el.textContent = "0.0s";
+
+  timerInterval = setInterval(() => {
+    if (!timerFrozen) {
+      const elapsed = ((Date.now() - timerStartTime) / 1000).toFixed(1);
+      if (el) el.textContent = `TTFT : ${elapsed}s`;
+    }
+  }, 100);
+}
+
+function freezeTimer() {
+  if (!timerFrozen) {
+    timerFrozen = true;
+    if (timerInterval !== null) {
+      clearInterval(timerInterval);
+      timerInterval = null;
+    }
+    // 显示最终时间
+    const el = document.getElementById("elapsed-timer");
+    const elapsed = ((Date.now() - timerStartTime) / 1000).toFixed(1);
+    if (el) el.textContent = `${elapsed}s`;
+  }
+}
+
 // ==================== Settings Functions ====================
 
 function populateModelSelect(selectedModelId?: string) {
@@ -358,8 +397,13 @@ async function handleClick() {
 
   // 重置 UI
   document.getElementById("answer")!.innerHTML = "";
-  document.getElementById("answerWrapper")!.style.display = "none";
+  document.getElementById("answerWrapper")!.style.display = "block";
   document.getElementById("loading-indicator")!.style.display = "block";
+  const elapsedTimerEl = document.getElementById("elapsed-timer");
+  if (elapsedTimerEl) elapsedTimerEl.style.display = "inline";
+  const copyBtn = document.getElementById("copyAnswer") as HTMLButtonElement | null;
+  if (copyBtn) copyBtn.style.visibility = "hidden";
+  startTimer();
 
   try {
     // 每次提交时重新获取最新的页面内容和缓存摘要
@@ -379,8 +423,8 @@ async function handleClick() {
     await sendStreamingChat(result.finalMessages as ChatMessage[]);
   } catch (err) {
     console.error("[Sidebar] Chat error:", err);
+    freezeTimer();
     document.getElementById("loading-indicator")!.style.display = "none";
-    document.getElementById("answerWrapper")!.style.display = "block";
     document.getElementById("answer")!.innerHTML = `Error: ${err}`;
   }
 }
@@ -407,33 +451,19 @@ async function processMultiTabQueryViaBackground(
 // ==================== UI 更新 ====================
 
 function updateAnswer(answer: string) {
-  document.getElementById("answerWrapper")!.style.display = "block";
-  const answerWithBreaks = answer.replace(/\n/g, "<br>");
-  document.getElementById("answer")!.innerHTML = answerWithBreaks;
-
-  // 复制按钮
-  const copyButton = document.getElementById("copyAnswer");
-  if (copyButton) {
-    copyButton.onclick = () => {
+  freezeTimer();
+  document.getElementById("loading-indicator")!.style.display = "none";
+  const copyBtn = document.getElementById("copyAnswer") as HTMLButtonElement | null;
+  if (copyBtn) {
+    copyBtn.style.visibility = "visible";
+    copyBtn.onclick = () => {
       navigator.clipboard.writeText(answer)
         .then(() => console.log("[Sidebar] Answer copied"))
         .catch((err) => console.error("[Sidebar] Copy error:", err));
     };
   }
-
-  // 时间戳
-  const options: Intl.DateTimeFormatOptions = {
-    month: "short",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  };
-  const time = new Date().toLocaleString("en-US", options);
-  document.getElementById("timestamp")!.innerText = time;
-
-  // 隐藏加载指示器
-  document.getElementById("loading-indicator")!.style.display = "none";
+  const answerWithBreaks = answer.replace(/\n/g, "<br>");
+  document.getElementById("answer")!.innerHTML = answerWithBreaks;
 }
 
 // ==================== 获取页面内容 ====================
@@ -506,7 +536,7 @@ async function fetchPageContents(): Promise<TabContent[]> {
               hasCachedSummary: !!cachedSummary
             });
 
-            console.log(`[Sidebar] Tab loaded: ${tab.title}, has cached summary: ${!!cachedSummary}`);
+            console.log(`[Sidebar] Tab loaded: ${tab.title}, summary: ${cachedSummary?.summary}`);
             resolve();
           });
 

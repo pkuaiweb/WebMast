@@ -89,11 +89,11 @@ The bundled extension is written to `./dist/` by [Parcel](https://parceljs.org/)
 1. Open `chrome://extensions`
 2. Enable **Developer mode** (top-right toggle)
 3. Click **Load unpacked** and select the `./dist/` directory
-4. Pin **MLCBot** to your toolbar
+4. Pin **WebMast** to your toolbar
 
 ### 3. Use
 
-1. Click the MLCBot icon → the side panel opens
+1. Click the WebMast icon → the side panel opens
 2. The model downloads and caches on first run (progress bar shown)
 3. Navigate to any webpage; the content script will automatically pre-process the page
 4. Type a question — the model answers in the context of the current page

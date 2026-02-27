@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <title>MLCBot Sidebar</title>
+    <title>WebMast Sidebar</title>
     <link rel="stylesheet" href="sidebar.css" />
     <link
       rel="stylesheet"
@@ -32,18 +32,17 @@
       </button>
     </div>
 
-    <div class="stage">
-      <div id="loading-indicator" class="dot-flashing"></div>
-    </div>
-
-    <div id="answerWrapper">
-      <div id="answer"></div>
-      <div class="copyRow">
-        <span id="timestamp"></span>
+    <div id="answerWrapper" style="display:none">
+       <div id="answer"></div>
+      <div id="status-row" class="status-row">
+        <span id="elapsed-timer" class="elapsed-timer"></span>
+        <div id="loading-indicator" class="dot-flashing"></div>
+        
         <button
           id="copyAnswer"
           class="btn copyButton"
           title="Copy the Answer to the Clipboard"
+          style="visibility:hidden"
         >
           <i class="fa-solid fa-copy fa-lg"></i>
         </button>

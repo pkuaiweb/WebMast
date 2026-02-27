@@ -96,6 +96,17 @@ p {
 #loading-indicator {
   display: none;
   color: white;
+}
+
+.elapsed-timer {
+  color: #9a8c98;
+}
+
+.status-row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
   margin-top: 0.5rem;
 }
 
