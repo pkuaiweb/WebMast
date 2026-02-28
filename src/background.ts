@@ -668,26 +668,56 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       });
       return true;
 
-    // ==================== 多标签页处理 ====================
-    case "PROCESS_MULTI_TAB_QUERY": {
-      const { tabContents, userMessage } = message.data;
-      
-      // 确保引擎就绪
-      if (!offscreenEngineReady) {
-        sendResponse({ success: false, error: "Engine not ready" });
-        return true;
-      }
-      
-      processMultiTabQuery(tabContents, userMessage)
-        .then(result => sendResponse(result))
-        .catch(err => sendResponse({ success: false, error: String(err) }));
-      return true;
-    }
-
     default:
       return false;
   }
 });
+
+// ==================== Streaming 辅助函数 ====================
+
+// 确保引擎就绪，失败时通过 port 通知 sidebar 并返回 false
+async function ensureEngineReadyForPort(port: chrome.runtime.Port): Promise<boolean> {
+  if (!offscreenEngineReady) {
+    port.postMessage({ type: "status", status: "initializing", progress: engineInitProgress });
+    const result = await initializeEngine();
+    if (result.status === "error") {
+      port.postMessage({ type: "error", error: result.error || "Engine initialization failed" });
+      return false;
+    }
+  }
+  if (!offscreenEngineReady) {
+    port.postMessage({ type: "error", error: "Engine not ready" });
+    return false;
+  }
+  return true;
+}
+
+async function startStreaming(port: chrome.runtime.Port, messages: any[]): Promise<void> {
+  if (!await ensureEngineReadyForPort(port)) return;
+
+  const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+  // 注册端口用于接收 streaming 响应
+  streamPorts.set(requestId, port);
+
+  // 发送请求到 offscreen
+  chrome.runtime.sendMessage({
+    type: "CHAT_COMPLETION_STREAM",
+    data: {
+      requestId,
+      messages: messages
+    }
+  }, (response) => {
+    if (chrome.runtime.lastError) {
+      port.postMessage({ type: "error", error: chrome.runtime.lastError.message });
+      streamPorts.delete(requestId);
+    } else if (response?.error) {
+      console.error("[Background] Stream start error:", response.error);
+      port.postMessage({ type: "error", error: response.error });
+      streamPorts.delete(requestId);
+    }
+  });
+}
 
 // ==================== Port 连接（用于 Streaming Chat）====================
 
@@ -698,43 +728,26 @@ chrome.runtime.onConnect.addListener((port) => {
     // Streaming chat 连接
     port.onMessage.addListener(async (message) => {
       if (message.type === "CHAT_STREAM_START") {
-        const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        // 直接 streaming：sidebar 已构建好 messages
+        await startStreaming(port, message.messages);
+      } else if (message.type === "PROCESS_AND_STREAM") {
+        // 合并请求：background 先处理多标签页，再直接 streaming
+        try {
+          if (!await ensureEngineReadyForPort(port)) return;
 
-        // 确保引擎就绪
-        if (!offscreenEngineReady) {
-          port.postMessage({ type: "status", status: "initializing", progress: engineInitProgress });
-          const result = await initializeEngine();
-          if (result.status === "error") {
-            port.postMessage({ type: "error", error: result.error || "Engine initialization failed" });
+          const { tabContents, userMessage } = message;
+          const queryResult = await processMultiTabQuery(tabContents, userMessage);
+
+          if (!queryResult.success || !queryResult.finalMessages) {
+            port.postMessage({ type: "error", error: queryResult.error || "Failed to process query" });
             return;
           }
+
+          // 直接将处理结果发送 streaming，中间结果不经由 sidebar
+          await startStreaming(port, queryResult.finalMessages);
+        } catch (err) {
+          port.postMessage({ type: "error", error: String(err) });
         }
-
-        if (!offscreenEngineReady) {
-          port.postMessage({ type: "error", error: "Engine not ready" });
-          return;
-        }
-
-        // 注册端口用于接收 streaming 响应
-        streamPorts.set(requestId, port);
-
-        // 发送请求到 offscreen
-        chrome.runtime.sendMessage({
-          type: "CHAT_COMPLETION_STREAM",
-          data: {
-            requestId,
-            messages: message.messages
-          }
-        }, (response) => {
-          if (chrome.runtime.lastError) {
-            port.postMessage({ type: "error", error: chrome.runtime.lastError.message });
-            streamPorts.delete(requestId);
-          } else if (response?.error) {
-            console.error("[Background] Stream start error:", response.error);
-            port.postMessage({ type: "error", error: response.error });
-            streamPorts.delete(requestId);
-          }
-        });
       }
     });
 

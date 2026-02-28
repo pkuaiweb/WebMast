@@ -114,7 +114,7 @@ function startTimer() {
   timerFrozen = false;
   timerStartTime = Date.now();
   const el = document.getElementById("elapsed-timer");
-  if (el) el.textContent = "0.0s";
+  if (el) el.textContent = "TTFT : 0.0s";
 
   timerInterval = setInterval(() => {
     if (!timerFrozen) {
@@ -134,7 +134,7 @@ function freezeTimer() {
     // 显示最终时间
     const el = document.getElementById("elapsed-timer");
     const elapsed = ((Date.now() - timerStartTime) / 1000).toFixed(1);
-    if (el) el.textContent = `${elapsed}s`;
+    if (el) el.textContent = `TTFT : ${elapsed}s`;
   }
 }
 
@@ -294,7 +294,7 @@ async function waitForEngineReady(): Promise<void> {
   return new Promise((resolve, reject) => {
     const check = async () => {
       const status = await checkEngineStatus();
-      
+      console.log("[Sidebar] Engine status:", status.ready ? "ready" : "not ready", `(${Math.round(status.progress * 100)}%)`);
       progressBar.animate(status.progress, { duration: 50 });
       
       if (status.ready) {
@@ -321,57 +321,6 @@ function enableInputs() {
     queryInput.focus();
     isLoadingParams = false;
   }
-}
-
-// ==================== Streaming Chat ====================
-
-// updateUI: true 更新 UI（最终答案），false 静默模式（中间处理）
-async function sendStreamingChat(messages: ChatMessage[], updateUI: boolean = true): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const port = chrome.runtime.connect({ name: "chat_stream" });
-    let fullMessage = "";
-
-    port.onMessage.addListener((message) => {
-      if (message.type === "chunk") {
-        const chunk = message.data as StreamChunk;
-        
-        if (chunk.error) {
-          reject(new Error(chunk.error));
-          port.disconnect();
-          return;
-        }
-
-        if (chunk.chunk) {
-          fullMessage += chunk.chunk;
-          if (updateUI) {
-            updateAnswer(fullMessage);
-          }
-        }
-
-        if (chunk.done) {
-          console.log("fullMessage:", fullMessage);
-          resolve(fullMessage);
-          port.disconnect();
-        }
-      } else if (message.type === "status") {
-        console.log("[Sidebar] Engine status:", message.status, message.progress);
-      } else if (message.type === "error") {
-        reject(new Error(message.error));
-        port.disconnect();
-      }
-    });
-
-    port.onDisconnect.addListener(() => {
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
-      }
-    });
-
-    port.postMessage({
-      type: "CHAT_STREAM_START",
-      messages: messages
-    });
-  });
 }
 
 // ==================== 事件监听器 ====================
@@ -412,15 +361,8 @@ async function handleClick() {
       console.log(`[Sidebar] Fetched ${allTabContents.length} tabs`);
     }
 
-    // 调用 Background 处理多标签页查询逻辑
-    const result = await processMultiTabQueryViaBackground(allTabContents, message);
-    
-    if (!result.success) {
-      throw new Error(result.error || "Failed to process query");
-    }
-
-    // 发送最终消息进行 streaming 输出
-    await sendStreamingChat(result.finalMessages as ChatMessage[]);
+    // 一次请求：background 内部完成多标签页处理 + streaming 输出
+    await processAndStream(allTabContents, message);
   } catch (err) {
     console.error("[Sidebar] Chat error:", err);
     freezeTimer();
@@ -429,21 +371,53 @@ async function handleClick() {
   }
 }
 
-// 调用 Background 处理多标签页查询
-async function processMultiTabQueryViaBackground(
+// 合并多标签页处理 + streaming 为一次 port 请求
+async function processAndStream(
   tabContents: TabContent[],
   userMessage: string
-): Promise<{ success: boolean; finalMessages?: ChatMessage[]; error?: string }> {
-  return new Promise((resolve) => {
-    chrome.runtime.sendMessage({
-      type: "PROCESS_MULTI_TAB_QUERY",
-      data: { tabContents, userMessage }
-    }, (response) => {
-      if (chrome.runtime.lastError) {
-        resolve({ success: false, error: chrome.runtime.lastError.message });
-      } else {
-        resolve(response || { success: false, error: "No response" });
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const port = chrome.runtime.connect({ name: "chat_stream" });
+    let fullMessage = "";
+
+    port.onMessage.addListener((message) => {
+      if (message.type === "chunk") {
+        const chunk = message.data as StreamChunk;
+
+        if (chunk.error) {
+          reject(new Error(chunk.error));
+          port.disconnect();
+          return;
+        }
+
+        if (chunk.chunk) {
+          fullMessage += chunk.chunk;
+          updateAnswer(fullMessage);
+        }
+
+        if (chunk.done) {
+          console.log("fullMessage:", fullMessage);
+          resolve(fullMessage);
+          port.disconnect();
+        }
+      } else if (message.type === "status") {
+        console.log("[Sidebar] Engine status:", message.status, message.progress);
+      } else if (message.type === "error") {
+        reject(new Error(message.error));
+        port.disconnect();
       }
+    });
+
+    port.onDisconnect.addListener(() => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+      }
+    });
+
+    port.postMessage({
+      type: "PROCESS_AND_STREAM",
+      tabContents: tabContents,
+      userMessage: userMessage
     });
   });
 }
@@ -536,7 +510,7 @@ async function fetchPageContents(): Promise<TabContent[]> {
               hasCachedSummary: !!cachedSummary
             });
 
-            console.log(`[Sidebar] Tab loaded: ${tab.title}, summary: ${cachedSummary?.summary}`);
+            console.log(`[Sidebar] Tab loaded: ${tab.title},\n\nsummary: ${cachedSummary?.summary}`);
             resolve();
           });
 
