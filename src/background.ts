@@ -47,7 +47,7 @@ interface EngineInitResult {
 
 const SUMMARY_CACHE_PREFIX = "page_summary_";
 const PENDING_CACHE_PREFIX = "pending_page_";
-const DEFAULT_MODEL_ID = "Qwen3-1.7B-q4f16_1-MLC" //"Llama-3.2-1B-Instruct-q4f16_1-MLC"// "Llama-3.2-3B-Instruct-q4f32_1-MLC";
+const DEFAULT_MODEL_ID = "Phi-3.5-mini-instruct-q4f16_1-MLC"//"Qwen3-1.7B-q4f16_1-MLC" //"Llama-3.2-1B-Instruct-q4f16_1-MLC"// "Llama-3.2-3B-Instruct-q4f32_1-MLC";
 const MODEL_STORAGE_KEY = "selected_model_id";
 
 let currentModelId = DEFAULT_MODEL_ID;
@@ -244,16 +244,18 @@ function parseSummaryResponse(response: string): { sufficient: boolean; answer: 
   // 检查 SUFFICIENT 字段
   const sufficientMatch = normalized.match(/\*{0,2}sufficient\*{0,2}:\s*(yes|no)/i);
   const isSufficient = sufficientMatch ? sufficientMatch[1].toLowerCase() === "yes" : false;
+
+  // sufficient:no -> 相关但不足，回退原始内容，无需 ANSWER（优先判断，避免被 answerMatch 缺失误拦截）
+  if (sufficientMatch && !isSufficient) {
+    return { sufficient: false, answer: "" };
+  }
+
   // 提取 ANSWER 字段
   const answerMatch = response.match(/\*{0,2}answer\*{0,2}:\s*([\s\S]*)/i);  
-  
+
   if (!sufficientMatch || !answerMatch) {
     // 模型未遵循格式，将整个响应作为答案
     return { sufficient: true, answer: response.trim() };
-  }
-  // sufficient:no -> 相关但不足，回退原始内容，无需 ANSWER
-  if (!isSufficient) {
-    return { sufficient: false, answer: "" };
   }
     let answer = answerMatch[1].trim();
     // 去除多余的星号（模型可能忽略格式要求）
@@ -286,7 +288,18 @@ async function answerFromContent(content: string, question: string): Promise<str
   const messages = [
     {
       role: "system",
-      content: "Answer the question based on the provided content. Format: Concise bullet points. If the content doesn't contain relevant information, say 'No relevant information'. No conversational filler."
+      content: [
+        "You are extracting information from ONE web page that is part of a multi-tab browsing session.",
+        "The user's question may span multiple tabs. Your job is to extract ANY relevant partial information from THIS page's content.",
+        "",
+        "Rules:",
+        "- If the content contains ANY data related to the question (prices, names, quantities, dates, etc.), extract and present it as concise bullet points.",
+        "- ALWAYS include exact numbers (review counts, ratings, prices, quantities) in your extraction — these are critical for filtering.",
+        "- Even a single relevant data point (e.g. one product's price) counts as relevant — extract it.",
+        "- Only say 'N/A' if the content is COMPLETELY unrelated to the question (e.g. the question asks about recipes but the page is about software).",
+        "- Do NOT say N/A just because the page alone cannot fully answer the question.",
+        "- No conversational filler."
+      ].join("\n")
     },
     {
       role: "user",
@@ -350,13 +363,18 @@ async function processMultiTabQuery(
           content: [
             "You are evaluating whether a page summary contains enough information to answer a question.",
             "",
+            "CRITICAL RULES:",
+            "1. Identify ALL constraints or conditions stated in the question (comparisons, thresholds, superlatives, categories, etc.).",
+            "2. A constraint is met ONLY when the summary provides an explicit value that satisfies it. Never assume a constraint is met if the relevant data is missing or ambiguous.",
+            "3. In your ANSWER, always state the key facts you extracted so downstream reasoning can double-check them.",
+            "",
             "You MUST follow one of these three response formats exactly (no markdown, no asterisks, no extra text):",
             "",
             "Case 1 – Summary is sufficient to answer the question:",
             "SUFFICIENT: yes",
-            "ANSWER: <your concise answer>",
+            "ANSWER: <concise answer with the key facts extracted from the summary>",
             "",
-            "Case 2 – Summary is relevant to the question but lacks enough detail:",
+            "Case 2 – Summary is relevant to the question but lacks enough detail to verify all constraints:",
             "SUFFICIENT: no",
             "",
             "Case 3 – Summary is completely unrelated to the question:",
@@ -376,13 +394,14 @@ async function processMultiTabQuery(
         
         if (parsedResult.sufficient) {
           compressedContent = parsedResult.answer;
-          isRelevant = !compressedContent.toLowerCase().includes("no relevant information") &&
-                       compressedContent.toLowerCase() !== "n/a" &&
+          isRelevant = compressedContent.trim().toLowerCase() !== "n/a" &&
                        compressedContent.trim() !== "";
         } else {
           // 摘要不够，使用原始内容
+          
           compressedContent = await answerFromContent(tabInfo.content, userMessage);
-          isRelevant = !compressedContent.toLowerCase().includes("no relevant information");
+          console.log(`[Background] Insufficient for: ${tabInfo.title}, answerFromContent: ${compressedContent}`);
+          isRelevant = compressedContent.trim().toLowerCase() !== "n/a";
         }
       } catch (err) {
         console.error(`[Background] Error processing tab ${tabInfo.title}:`, err);
@@ -394,7 +413,7 @@ async function processMultiTabQuery(
       console.log(`[Background] No cached summary for: ${tabInfo.title}`);
       try {
         compressedContent = await answerFromContent(tabInfo.content, userMessage);
-        isRelevant = !compressedContent.toLowerCase().includes("no relevant information");
+        isRelevant = compressedContent.trim().toLowerCase() !== "n/a";
       } catch (err) {
         console.error(`[Background] Error processing tab ${tabInfo.title}:`, err);
         compressedContent = "Error processing this tab";
@@ -481,7 +500,7 @@ async function processSummarizationQueue() {
           contentLength: pageData.content.length
         });
         await removePendingPage(url);
-        console.log("[Background] Summary saved:", pageData.title);
+        console.log("[Background] Summary saved:", pageData.title, response.summary);
       } else if (response?.error) {
         console.error("[Background] Summarization error for", pageData.title, ":", response.error);
         // 清理 pending 数据，避免残留
@@ -544,7 +563,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     case "ENGINE_INIT_PROGRESS":
       engineInitProgress = message.data.progress;
-      // console.log("[Background] Engine progress:", Math.round(engineInitProgress * 100) + "%");
       sendResponse({ status: "acknowledged" });
       return true;
 
