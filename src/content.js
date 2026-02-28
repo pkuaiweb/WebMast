@@ -7,6 +7,13 @@ chrome.runtime.onConnect.addListener(function (port) {
   });
 });
 
+// Message-based content retrieval (used by background)
+chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
+  if (message.type === "GET_PAGE_CONTENT") {
+    sendResponse({ contents: document.body.innerText });
+  }
+});
+
 // Pre-process page when it loads - send content to background for summarization
 function notifyBackgroundForPreprocessing() {
   const pageContent = document.body.innerText;

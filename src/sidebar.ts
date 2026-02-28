@@ -23,22 +23,6 @@ interface ChatMessage {
   content: string;
 }
 
-interface CachedSummaryData {
-  url: string;
-  title: string;
-  summary: string;
-  timestamp: number;
-  contentLength: number;
-}
-
-interface TabContent {
-  title: string;
-  url: string;
-  content: string;
-  cachedSummary?: string;
-  hasCachedSummary: boolean;
-}
-
 interface StreamChunk {
   requestId: string;
   chunk?: string;
@@ -96,7 +80,6 @@ const progressBar: ProgressBar = new Line("#loadingContainer", {
 // ==================== 状态管理 ====================
 
 let isLoadingParams = true;
-let allTabContents: TabContent[] = [];
 let currentModelId = "";
 
 // ==================== 计时器 ====================
@@ -355,14 +338,8 @@ async function handleClick() {
   startTimer();
 
   try {
-    // 每次提交时重新获取最新的页面内容和缓存摘要
-    if (useContext) {
-      allTabContents = await fetchPageContents();
-      console.log(`[Sidebar] Fetched ${allTabContents.length} tabs`);
-    }
-
-    // 一次请求：background 内部完成多标签页处理 + streaming 输出
-    await processAndStream(allTabContents, message);
+    // 一次请求：background 自行收集标签页内容 + 多标签页处理 + streaming 输出
+    await processAndStream(message);
   } catch (err) {
     console.error("[Sidebar] Chat error:", err);
     freezeTimer();
@@ -371,11 +348,8 @@ async function handleClick() {
   }
 }
 
-// 合并多标签页处理 + streaming 为一次 port 请求
-async function processAndStream(
-  tabContents: TabContent[],
-  userMessage: string
-): Promise<string> {
+// 发送用户消息到 background，由 background 自行收集标签页内容 + 处理 + streaming
+async function processAndStream(userMessage: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const port = chrome.runtime.connect({ name: "chat_stream" });
     let fullMessage = "";
@@ -416,8 +390,8 @@ async function processAndStream(
 
     port.postMessage({
       type: "PROCESS_AND_STREAM",
-      tabContents: tabContents,
-      userMessage: userMessage
+      userMessage: userMessage,
+      useContext: useContext
     });
   });
 }
@@ -440,98 +414,7 @@ function updateAnswer(answer: string) {
   document.getElementById("answer")!.innerHTML = answerWithBreaks;
 }
 
-// ==================== 获取页面内容 ====================
 
-async function getCachedSummary(url: string): Promise<CachedSummaryData | null> {
-  return new Promise((resolve) => {
-    chrome.runtime.sendMessage(
-      { type: "GET_CACHED_SUMMARY", data: { url } },
-      (response) => {
-        if (chrome.runtime.lastError) {
-          console.warn("[Sidebar] Error getting cached summary:", chrome.runtime.lastError);
-          resolve(null);
-        } else {
-          resolve(response?.summary || null);
-        }
-      }
-    );
-  });
-}
-
-async function getAllCachedSummaries(): Promise<{ [url: string]: CachedSummaryData }> {
-  return new Promise((resolve) => {
-    chrome.runtime.sendMessage(
-      { type: "GET_ALL_CACHED_SUMMARIES" },
-      (response) => {
-        if (chrome.runtime.lastError) {
-          console.warn("[Sidebar] Error getting cached summaries:", chrome.runtime.lastError);
-          resolve({});
-        } else {
-          resolve(response?.summaries || {});
-        }
-      }
-    );
-  });
-}
-
-async function fetchPageContents(): Promise<TabContent[]> {
-  const tabs = await chrome.tabs.query({ currentWindow: true });
-  if (tabs.length === 0) {
-    console.warn("[Sidebar] No tabs found");
-    return [];
-  }
-
-  const results: TabContent[] = [];
-  const promises: Promise<void>[] = [];
-
-  for (const tab of tabs) {
-    if (!tab.id) continue;
-    promises.push(
-      new Promise<void>((resolve) => {
-        try {
-          const port = chrome.tabs.connect(tab.id!, { name: "channelName" });
-          port.postMessage({});
-
-          const timeout = setTimeout(() => {
-            port.disconnect();
-            resolve();
-          }, 3000);
-
-          port.onMessage.addListener(async (msg) => {
-            clearTimeout(timeout);
-            const tabUrl = tab.url || "Unknown URL";
-            const cachedSummary = await getCachedSummary(tabUrl);
-
-            results.push({
-              title: tab.title || "Untitled",
-              url: tabUrl,
-              content: msg.contents,
-              cachedSummary: cachedSummary?.summary,
-              hasCachedSummary: !!cachedSummary
-            });
-
-            console.log(`[Sidebar] Tab loaded: ${tab.title},\n\nsummary: ${cachedSummary?.summary}`);
-            resolve();
-          });
-
-          port.onDisconnect.addListener(() => {
-            clearTimeout(timeout);
-            if (chrome.runtime.lastError) {
-              console.warn(`[Sidebar] Could not connect to tab ${tab.id}: ${chrome.runtime.lastError.message}`);
-            }
-            resolve();
-          });
-        } catch (error) {
-          console.warn(`[Sidebar] Failed to connect to tab ${tab.id}:`, error);
-          resolve();
-        }
-      })
-    );
-  }
-
-  await Promise.all(promises);
-  return results;
-}
 
 // ==================== 初始化 ====================
 

@@ -217,6 +217,46 @@ async function removePendingPage(url: string): Promise<void> {
   await chrome.storage.local.remove(cacheKey);
 }
 
+// ==================== 标签页内容收集 ====================
+
+// 从所有标签页收集内容（由 background 直接调用，无需经过 sidebar 中转）
+async function fetchAllTabContents(): Promise<TabContentInfo[]> {
+  const tabs = await chrome.tabs.query({ lastFocusedWindow: true });
+  if (tabs.length === 0) {
+    console.warn("[Background] No tabs found");
+    return [];
+  }
+
+  const results: TabContentInfo[] = [];
+
+  const promises = tabs.map(async (tab) => {
+    if (!tab.id) return;
+    try {
+      const response = await chrome.tabs.sendMessage(tab.id, { type: "GET_PAGE_CONTENT" });
+      if (response?.contents) {
+        const tabUrl = tab.url || "Unknown URL";
+        const cachedSummary = await getCachedSummary(tabUrl);
+
+        results.push({
+          title: tab.title || "Untitled",
+          url: tabUrl,
+          content: response.contents,
+          cachedSummary: cachedSummary?.summary,
+          hasCachedSummary: !!cachedSummary
+        });
+
+        console.log(`[Background] Tab loaded: ${tab.title}, hasSummary: ${!!cachedSummary}`);
+      }
+    } catch (error) {
+      // 无法连接的标签页（如 chrome:// 页面），静默跳过
+      console.warn(`[Background] Failed to get content from tab ${tab.id} (${tab.url}):`, error);
+    }
+  });
+
+  await Promise.all(promises);
+  return results;
+}
+
 // ==================== 多标签页处理逻辑 ====================
 
 interface TabContentInfo {
@@ -731,11 +771,19 @@ chrome.runtime.onConnect.addListener((port) => {
         // 直接 streaming：sidebar 已构建好 messages
         await startStreaming(port, message.messages);
       } else if (message.type === "PROCESS_AND_STREAM") {
-        // 合并请求：background 先处理多标签页，再直接 streaming
+        // 合并请求：background 自行收集标签页内容 + 处理多标签页 + streaming
         try {
           if (!await ensureEngineReadyForPort(port)) return;
 
-          const { tabContents, userMessage } = message;
+          const { userMessage, useContext } = message;
+
+          // Background 自行收集标签页内容
+          let tabContents: TabContentInfo[] = [];
+          if (useContext) {
+            tabContents = await fetchAllTabContents();
+            console.log(`[Background] Fetched ${tabContents.length} tabs`);
+          }
+
           const queryResult = await processMultiTabQuery(tabContents, userMessage);
 
           if (!queryResult.success || !queryResult.finalMessages) {
