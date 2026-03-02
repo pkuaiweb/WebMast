@@ -49,7 +49,7 @@ const SUMMARY_CACHE_PREFIX = "page_summary_";
 const PENDING_CACHE_PREFIX = "pending_page_";
 const DEFAULT_MODEL_ID = "Phi-3.5-mini-instruct-q4f16_1-MLC"//"Qwen3-1.7B-q4f16_1-MLC" //"Llama-3.2-1B-Instruct-q4f16_1-MLC"// "Llama-3.2-3B-Instruct-q4f32_1-MLC";
 const MODEL_STORAGE_KEY = "selected_model_id";
-
+const USE_SUMMARY_CACHE = false; // 是否启用摘要缓存
 let currentModelId = DEFAULT_MODEL_ID;
 
 // Load model ID from storage
@@ -303,8 +303,23 @@ function parseSummaryResponse(response: string): { sufficient: boolean; answer: 
     return { sufficient: isSufficient, answer };
 }
 
+// 如果模型是 Qwen3，在最后一条 user 消息末尾追加 /nothink
+function appendNothinkIfQwen3(messages: Array<{ role: string; content: string }>): Array<{ role: string; content: string }> {
+  if (!currentModelId.toLowerCase().includes("qwen3")) return messages;
+  const result = messages.map(m => ({ ...m }));
+  for (let i = result.length - 1; i >= 0; i--) {
+    if (result[i].role === "user") {
+      result[i].content += " /nothink /no_think";
+      break;
+    }
+    // result[i].content="/no_think "+result[i].content+" /no_think";
+  }
+  return result;
+}
+
 // 调用 offscreen 进行静默 chat（中间处理，不更新 UI）
 async function silentChat(messages: Array<{ role: string; content: string }>): Promise<string> {
+  messages = appendNothinkIfQwen3(messages);
   return new Promise((resolve, reject) => {
     const requestId = `silent_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     
@@ -315,12 +330,24 @@ async function silentChat(messages: Array<{ role: string; content: string }>): P
       if (chrome.runtime.lastError) {
         reject(new Error(chrome.runtime.lastError.message));
       } else if (response?.success) {
+        if (response.content?.includes("</think>")) {
+          response.content = response.content.split("</think>")[1].trim();
+        }
         resolve(response.content || "");
       } else {
         reject(new Error(response?.error || "Unknown error"));
       }
     });
   });
+}
+
+// 判断模型响应是否为"无关"（兜底否定性描述）
+function isIrrelevantAnswer(text: string): boolean {
+  const t = text.trim().toLowerCase();
+  if (t.includes("n/a") || t === "") return true;
+  // 兜底：模型未遵循格式，输出了否定性描述而非 N/A
+  const negativePatterns = /^[•\-\*]?\s*(no\s+(specific\s+)?(information|data|details|color|price|mention|content)|not\s+(found|mentioned|available|applicable)|n\/a|none|nothing\s+(found|relevant))/i;
+  return negativePatterns.test(t);
 }
 
 // 从内容中回答问题
@@ -332,17 +359,13 @@ async function answerFromContent(content: string, question: string): Promise<str
         "You are extracting information from ONE web page that is part of a multi-tab browsing session.",
         "The user's question may span multiple tabs. Your job is to extract ANY relevant partial information from THIS page's content.",
         "",
-        "CRITICAL: You may ONLY extract data that is EXPLICITLY written in the CONTENT. Do NOT infer, guess, or use your own knowledge. If a fact is not literally present in the text, do NOT include it.",
-        "",
         "Rules:",
-        "- Extract ONLY concrete data points that appear VERBATIM in the content.",
-        "- ALWAYS include exact numbers in your extraction — these are critical.",
-        "- Even a single relevant data point counts as relevant — extract it.",
+        "- If the content contains ANY data related to the question (prices, names, quantities, dates, etc.), extract and present it as concise bullet points.",
+        "- ALWAYS include exact numbers (review counts, ratings, prices, quantities) in your extraction — these are critical for filtering.",
+        "- Even a single relevant data point (e.g. one product's price) counts as relevant — extract it.",
+        "- Only say 'N/A' if the content is COMPLETELY unrelated to the question (e.g. the question asks about recipes but the page is about software).",
         "- Do NOT say N/A just because the page alone cannot fully answer the question.",
-        "- NEVER guess or infer information based on the product/page type.",
-        "- NEVER output negative statements like 'No X found' or 'Not mentioned'.",
-        "- If the content does not EXPLICITLY contain data answering the question, respond with EXACTLY: N/A",
-        "- Your output must be EITHER concrete bullet points quoting real data from the content, OR the single token N/A. Nothing else."
+        "- No conversational filler."
       ].join("\n")
     },
     {
@@ -397,7 +420,7 @@ async function processMultiTabQuery(
     let compressedContent = "";
     let isRelevant = true;
 
-    if (tabInfo.hasCachedSummary && tabInfo.cachedSummary) {
+    if (USE_SUMMARY_CACHE && tabInfo.hasCachedSummary && tabInfo.cachedSummary) {
       // 使用缓存的摘要
       console.log(`[Background] Using cached summary for: ${tabInfo.title}`);
       
@@ -438,14 +461,13 @@ async function processMultiTabQuery(
         
         if (parsedResult.sufficient) {
           compressedContent = parsedResult.answer;
-          isRelevant = compressedContent.trim().toLowerCase() !== "n/a" &&
-                       compressedContent.trim() !== "";
+          isRelevant = !isIrrelevantAnswer(compressedContent);
         } else {
           // 摘要不够，使用原始内容
           
           compressedContent = await answerFromContent(tabInfo.content, userMessage);
           console.log(`[Background] Insufficient for: ${tabInfo.title}, answerFromContent: ${compressedContent}`);
-          isRelevant = compressedContent.trim().toLowerCase() !== "n/a";
+          isRelevant = !isIrrelevantAnswer(compressedContent);
         }
       } catch (err) {
         console.error(`[Background] Error processing tab ${tabInfo.title}:`, err);
@@ -454,10 +476,10 @@ async function processMultiTabQuery(
       }
     } else {
       // 无缓存摘要，直接使用原始内容
-      console.log(`[Background] No cached summary for: ${tabInfo.title}`);
       try {
         compressedContent = await answerFromContent(tabInfo.content, userMessage);
-        isRelevant = compressedContent.trim().toLowerCase() !== "n/a";
+        console.log(`[Background] answerFromContent: ${compressedContent}`);
+        isRelevant = !isIrrelevantAnswer(compressedContent);
       } catch (err) {
         console.error(`[Background] Error processing tab ${tabInfo.title}:`, err);
         compressedContent = "Error processing this tab";
@@ -689,12 +711,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const { url, title, content } = message.data;
       console.log("[Background] PAGE_LOADED:", title, "length:", content?.length);
       
-      if (content && content.length > CONFIG.minContentLength) {
+      if (USE_SUMMARY_CACHE && content && content.length > CONFIG.minContentLength) {
         queuePageForSummarization(url, title, content).then(() => {
           sendResponse({ status: "queued" });
         });
       } else {
-        sendResponse({ status: "skipped", reason: "content too short" });
+        sendResponse({ status: "skipped" });
       }
       return true;
     }
@@ -738,6 +760,7 @@ async function ensureEngineReadyForPort(port: chrome.runtime.Port): Promise<bool
 
 async function startStreaming(port: chrome.runtime.Port, messages: any[]): Promise<void> {
   if (!await ensureEngineReadyForPort(port)) return;
+  messages = appendNothinkIfQwen3(messages);
 
   const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
