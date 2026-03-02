@@ -205,10 +205,10 @@ async function chatCompletionStream(
 
       // 检查 chunk 间隔超时
       const now = Date.now();
-      if (now - lastChunkTime > CHUNK_TIMEOUT_MS) {
-        await engine.interruptGenerate();
-        throw new Error("Stream stalled - no chunk received for " + CHUNK_TIMEOUT_MS + "ms");
-      }
+      // if (now - lastChunkTime > CHUNK_TIMEOUT_MS) {
+      //   await engine.interruptGenerate();
+      //   throw new Error("Stream stalled - no chunk received for " + CHUNK_TIMEOUT_MS + "ms");
+      // }
       lastChunkTime = now;
 
       const delta = chunk.choices[0]?.delta?.content;
@@ -293,10 +293,10 @@ async function summarizePage(
 
       // 检查 chunk 间隔超时
       const now = Date.now();
-      if (now - lastChunkTime > CHUNK_TIMEOUT_MS) {
-        await engine.interruptGenerate();
-        throw new Error("Stream stalled - no chunk received for " + CHUNK_TIMEOUT_MS + "ms");
-      }
+      // if (now - lastChunkTime > CHUNK_TIMEOUT_MS) {
+      //   await engine.interruptGenerate();
+      //   throw new Error("Stream stalled - no chunk received for " + CHUNK_TIMEOUT_MS + "ms");
+      // }
       lastChunkTime = now;
 
       const delta = chunk.choices[0]?.delta?.content;

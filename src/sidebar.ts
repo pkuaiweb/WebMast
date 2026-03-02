@@ -270,7 +270,7 @@ async function checkEngineStatus(): Promise<{ ready: boolean; progress: number; 
 
 // 仅轮询等待引擎就绪（不触发初始化，用于已知正在初始化的场景）
 async function waitForEngineReady(): Promise<void> {
-  const checkInterval = 500;
+  const checkInterval = 2000;
   const maxWaitTime = 120000; // 2分钟超时
   const startTime = Date.now();
 
@@ -283,9 +283,11 @@ async function waitForEngineReady(): Promise<void> {
       if (status.ready) {
         enableInputs();
         resolve();
-      } else if (Date.now() - startTime > maxWaitTime) {
-        reject(new Error("Engine initialization timeout"));
-      } else {
+      } 
+      // else if (Date.now() - startTime > maxWaitTime) {
+      //   reject(new Error("Engine initialization timeout"));
+      // } 
+      else {
         setTimeout(check, checkInterval);
       }
     };

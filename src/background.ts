@@ -332,13 +332,17 @@ async function answerFromContent(content: string, question: string): Promise<str
         "You are extracting information from ONE web page that is part of a multi-tab browsing session.",
         "The user's question may span multiple tabs. Your job is to extract ANY relevant partial information from THIS page's content.",
         "",
+        "CRITICAL: You may ONLY extract data that is EXPLICITLY written in the CONTENT. Do NOT infer, guess, or use your own knowledge. If a fact is not literally present in the text, do NOT include it.",
+        "",
         "Rules:",
-        "- If the content contains ANY data related to the question (prices, names, quantities, dates, etc.), extract and present it as concise bullet points.",
-        "- ALWAYS include exact numbers (review counts, ratings, prices, quantities) in your extraction — these are critical for filtering.",
-        "- Even a single relevant data point (e.g. one product's price) counts as relevant — extract it.",
-        "- Only say 'N/A' if the content is COMPLETELY unrelated to the question (e.g. the question asks about recipes but the page is about software).",
+        "- Extract ONLY concrete data points that appear VERBATIM in the content.",
+        "- ALWAYS include exact numbers in your extraction — these are critical.",
+        "- Even a single relevant data point counts as relevant — extract it.",
         "- Do NOT say N/A just because the page alone cannot fully answer the question.",
-        "- No conversational filler."
+        "- NEVER guess or infer information based on the product/page type.",
+        "- NEVER output negative statements like 'No X found' or 'Not mentioned'.",
+        "- If the content does not EXPLICITLY contain data answering the question, respond with EXACTLY: N/A",
+        "- Your output must be EITHER concrete bullet points quoting real data from the content, OR the single token N/A. Nothing else."
       ].join("\n")
     },
     {
