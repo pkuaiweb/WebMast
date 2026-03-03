@@ -24,6 +24,75 @@ let currentModelId = "";
 // 请求管理（用于取消）
 const activeRequests = new Map<string, { aborted: boolean }>();
 
+// ==================== 抗复读配置 ====================
+
+/**
+ * 强力抗复读
+ * repetition_penalty 会惩罚整个上下文（含 prompt）中出现过的 token，
+ * 仅在长文本流式生成时使用。
+ */
+const ANTI_REPEAT_CONFIG = {
+  repetition_penalty: 1.15,   // >1.0 降低已生成 token 的概率
+  frequency_penalty: 0.5,     // 按词频累加惩罚
+  presence_penalty: 0.5,      // 只要出现过就施加惩罚
+  temperature: 0.8,           // 略高随机性，避免贪心解码陷入循环
+  top_p: 0.9,
+};
+
+/**
+ * 温和参数
+ * 不设 repetition_penalty，避免模型无法复述页面中的关键词而返回 N/A。
+ * 仅用轻度 frequency_penalty 防止极端循环。
+ */
+const MILD_REPEAT_CONFIG = {
+  frequency_penalty: 0.15,
+  presence_penalty: 0.1,
+  temperature: 0.6,
+  top_p: 0.9,
+};
+
+/**
+ * 流式复读检测器
+ * 检测连续 n-gram 重复，若最近窗口内重复率过高则报告复读。
+ */
+class RepetitionDetector {
+  private buffer = "";
+  private readonly windowSize: number;    // 检测窗口（字符数）
+  private readonly ngramLen: number;      // n-gram 长度
+  private readonly threshold: number;     // 重复率阈值
+
+  constructor(windowSize = 300, ngramLen = 20, threshold = 0.4) {
+    this.windowSize = windowSize;
+    this.ngramLen = ngramLen;
+    this.threshold = threshold;
+  }
+
+  feed(text: string): void {
+    this.buffer += text;
+  }
+
+  /** 返回 true 表示检测到严重复读 */
+  isRepeating(): boolean {
+    if (this.buffer.length < this.windowSize) return false;
+    const window = this.buffer.slice(-this.windowSize);
+    const ngrams = new Map<string, number>();
+    let total = 0;
+    let repeated = 0;
+    for (let i = 0; i <= window.length - this.ngramLen; i++) {
+      const gram = window.substring(i, i + this.ngramLen);
+      const count = ngrams.get(gram) || 0;
+      ngrams.set(gram, count + 1);
+      total++;
+      if (count > 0) repeated++;
+    }
+    return total > 0 && repeated / total > this.threshold;
+  }
+
+  reset(): void {
+    this.buffer = "";
+  }
+}
+
 // ==================== 引擎初始化 ====================
 
 async function initEngine(modelId: string) {
@@ -114,6 +183,10 @@ async function initEngine(modelId: string) {
 
 // ==================== Chat Completion ====================
 
+/**
+ * 非流式 chat —— 内部改为流式生成 + 实时复读检测。
+ * 一旦检测到 n-gram 重复，立即中断并返回已积累的有效内容。
+ */
 async function chatCompletion(
   requestId: string,
   messages: ChatCompletionMessageParam[]
@@ -127,20 +200,41 @@ async function chatCompletion(
 
   try {
     const completion = await engine.chat.completions.create({
-      stream: false,
+      stream: true,
       messages: messages,
+      ...MILD_REPEAT_CONFIG,
     });
 
-    // 检查是否已取消
-    if (activeRequests.get(requestId)?.aborted) {
-      throw new Error("Request aborted");
+    let content = "";
+    let usage = null;
+    const detector = new RepetitionDetector();
+
+    for await (const chunk of completion) {
+      // 检查是否已取消
+      if (activeRequests.get(requestId)?.aborted) {
+        await engine.interruptGenerate();
+        throw new Error("Request aborted");
+      }
+
+      const delta = chunk.choices[0]?.delta?.content;
+      if (delta) {
+        content += delta;
+        detector.feed(delta);
+
+        // 复读检测：若检测到严重重复则中断，返回已有内容
+        if (detector.isRepeating()) {
+          console.warn("[Offscreen] Repetition detected in chatCompletion, interrupting. requestId:", requestId);
+          await engine.interruptGenerate();
+          break;
+        }
+      }
+
+      if (chunk.usage) {
+        usage = chunk.usage;
+      }
     }
 
-    const content = completion.choices[0]?.message?.content || "";
-    return { 
-      content,
-      usage: completion.usage
-    };
+    return { content, usage };
 
   } finally {
     activeRequests.delete(requestId);
@@ -184,6 +278,7 @@ async function chatCompletionStream(
         stream: true,
         messages: messages,
         stream_options: { include_usage: true },
+        // ...ANTI_REPEAT_CONFIG,
       }),
       STREAM_TIMEOUT_MS,
       "Chat completion create"
@@ -191,6 +286,7 @@ async function chatCompletionStream(
 
     let usage = null;
     let lastChunkTime = Date.now();
+    const detector = new RepetitionDetector();
 
     for await (const chunk of completion) {
       // 检查是否已取消
@@ -205,14 +301,28 @@ async function chatCompletionStream(
 
       // 检查 chunk 间隔超时
       const now = Date.now();
-      // if (now - lastChunkTime > CHUNK_TIMEOUT_MS) {
-      //   await engine.interruptGenerate();
-      //   throw new Error("Stream stalled - no chunk received for " + CHUNK_TIMEOUT_MS + "ms");
-      // }
       lastChunkTime = now;
 
       const delta = chunk.choices[0]?.delta?.content;
       if (delta) {
+        detector.feed(delta);
+
+        // 复读检测：若检测到严重重复则中断生成
+        if (detector.isRepeating()) {
+          console.warn("[Offscreen] Repetition detected, interrupting generation for request:", requestId);
+          await engine.interruptGenerate();
+          chrome.runtime.sendMessage({
+            type: "STREAM_CHUNK",
+            data: { requestId, chunk: "\n\n[... 检测到重复内容，已自动停止生成]", done: false }
+          }).catch(() => {});
+          // 发送完成信号
+          chrome.runtime.sendMessage({
+            type: "STREAM_CHUNK",
+            data: { requestId, done: true, usage }
+          }).catch(() => {});
+          return;
+        }
+
         // 发送 chunk 到 background
         chrome.runtime.sendMessage({
           type: "STREAM_CHUNK",
@@ -277,12 +387,14 @@ async function summarizePage(
       engine.chat.completions.create({
         stream: true,
         messages: messages,
+        ...ANTI_REPEAT_CONFIG,
       }),
       STREAM_TIMEOUT_MS,
       "Summarize completion create"
     );
 
     let lastChunkTime = Date.now();
+    const detector = new RepetitionDetector();
 
     for await (const chunk of completion) {
       // 检查是否已取消
@@ -293,15 +405,19 @@ async function summarizePage(
 
       // 检查 chunk 间隔超时
       const now = Date.now();
-      // if (now - lastChunkTime > CHUNK_TIMEOUT_MS) {
-      //   await engine.interruptGenerate();
-      //   throw new Error("Stream stalled - no chunk received for " + CHUNK_TIMEOUT_MS + "ms");
-      // }
       lastChunkTime = now;
 
       const delta = chunk.choices[0]?.delta?.content;
       if (delta) {
         summary += delta;
+
+        // 复读检测：若检测到严重重复则中断
+        detector.feed(delta);
+        if (detector.isRepeating()) {
+          console.warn("[Offscreen] Repetition detected during summarization, stopping.");
+          await engine.interruptGenerate();
+          break;
+        }
       }
     }
 

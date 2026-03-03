@@ -363,7 +363,7 @@ async function answerFromContent(content: string, question: string): Promise<str
         "- If the content contains ANY data related to the question (prices, names, quantities, dates, etc.), extract and present it as concise bullet points.",
         "- ALWAYS include exact numbers (review counts, ratings, prices, quantities) in your extraction — these are critical for filtering.",
         "- Even a single relevant data point (e.g. one product's price) counts as relevant — extract it.",
-        "- Only say 'N/A' if the content is COMPLETELY unrelated to the question (e.g. the question asks about recipes but the page is about software).",
+        "- Only say 'N/A' if the content is COMPLETELY unrelated to the question.",
         "- Do NOT say N/A just because the page alone cannot fully answer the question.",
         "- No conversational filler."
       ].join("\n")
@@ -396,7 +396,7 @@ async function processMultiTabQuery(
       finalMessages: [
         {
           role: "system",
-          content: `You are a helpful assistant. Here is the content of the browser tab:\n\n${pageContext}\n\nPlease answer questions about this webpage.`
+          content: `You are a helpful assistant. Here is the content of the browser tab:\n\n${pageContext}\n\nPlease answer questions about this webpage. Keep your response concise and do NOT repeat the same information.`
         },
         { role: "user", content: userMessage }
       ]
@@ -479,7 +479,7 @@ async function processMultiTabQuery(
       try {
         compressedContent = await answerFromContent(tabInfo.content, userMessage);
         console.log(`[Background] answerFromContent: ${compressedContent}`);
-        isRelevant = !isIrrelevantAnswer(compressedContent);
+        // isRelevant = !isIrrelevantAnswer(compressedContent);
       } catch (err) {
         console.error(`[Background] Error processing tab ${tabInfo.title}:`, err);
         compressedContent = "Error processing this tab";
@@ -511,8 +511,8 @@ async function processMultiTabQuery(
       {
         role: "system",
         content: relevantTabs.length > 0
-          ? `You are a helpful assistant. The user has ${allTabContents.length} browser tabs open. Below is the relevant information extracted from ${relevantTabs.length} relevant tabs:\n\n${combinedContext}\n\nPlease provide a comprehensive answer.`
-          : `You are a helpful assistant. The user has ${allTabContents.length} browser tabs open, but none contain relevant information. Please let the user know.`
+          ? `You are a helpful assistant. The user has ${allTabContents.length} browser tabs open. Below is the relevant information extracted from ${relevantTabs.length} relevant tabs:\n\n${combinedContext}\n\nPlease provide a comprehensive answer. Be concise and NEVER repeat the same sentence, phrase, or point.`
+          : `You are a helpful assistant. The user has ${allTabContents.length} browser tabs open, but none contain relevant information. Please let the user know briefly.`
       },
       { role: "user", content: userMessage }
     ]
