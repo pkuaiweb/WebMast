@@ -183,80 +183,142 @@ async function initEngine(modelId: string) {
 
 // ==================== Chat Completion ====================
 
+// ==================== 超时配置 ====================
+
+const STREAM_TIMEOUT_MS = 30000; // 60秒超时
+
+// ==================== 通用生成内核 ====================
+
+interface GenerateCallbacks {
+  /** 每产出一段 delta 文本时调用 */
+  onChunk: (delta: string) => void;
+  /** 生成正常完成时调用 */
+  onDone: (usage: any) => void;
+  /** 请求被取消时调用 */
+  onAbort: () => void;
+}
+
 /**
- * 非流式 chat —— 内部改为流式生成 + 实时复读检测。
- * 一旦检测到 n-gram 重复，立即中断并返回已积累的有效内容。
+ * 统一的流式生成内核。
+ * 负责：超时 (Promise.race)、abort 检测、复读检测、KV cache 清理。
+ * chatCompletion / chatCompletionStream 都委托给它。
  */
-async function chatCompletion(
+async function generateCore(
   requestId: string,
-  messages: ChatCompletionMessageParam[]
+  messages: ChatCompletionMessageParam[],
+  callbacks: GenerateCallbacks,
+  extraCreateParams: Record<string, any> = {},
 ): Promise<{ content: string; usage?: any }> {
   if (!engine || !engineReady) {
     throw new Error("Engine not ready");
   }
 
-  // 注册请求
   activeRequests.set(requestId, { aborted: false });
 
+  let timedOut = false;
+  let aborted = false;
+  let content = "";
+  let usage: any = null;
+  let timeoutTimer: ReturnType<typeof setTimeout>;
+  const timeoutPromise = new Promise<{ content: string; usage?: any }>((resolve) => {
+    timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      console.warn("[Offscreen] generateCore timeout, interrupting. requestId:", requestId);
+      engine!.interruptGenerate();
+      // 超时也调用 onDone，返回已生成的部分内容
+      callbacks.onDone(usage);
+      resolve({ content, usage });
+    }, STREAM_TIMEOUT_MS);
+  });
+
   try {
-    const completion = await engine.chat.completions.create({
-      stream: true,
-      messages: messages,
-      ...MILD_REPEAT_CONFIG,
-    });
+    return await Promise.race([
+      (async (): Promise<{ content: string; usage?: any }> => {
+        const completion = await engine!.chat.completions.create({
+          stream: true,
+          messages,
+          stream_options: { include_usage: true },
+          ...extraCreateParams,
+        });
 
-    let content = "";
-    let usage = null;
-    const detector = new RepetitionDetector();
+        const detector = new RepetitionDetector();
 
-    for await (const chunk of completion) {
-      // 检查是否已取消
-      if (activeRequests.get(requestId)?.aborted) {
-        await engine.interruptGenerate();
-        throw new Error("Request aborted");
-      }
+        for await (const chunk of completion) {
+          if (timedOut) break;
 
-      const delta = chunk.choices[0]?.delta?.content;
-      if (delta) {
-        content += delta;
-        detector.feed(delta);
+          // 检查 abort
+          if (activeRequests.get(requestId)?.aborted) {
+            aborted = true;
+            await engine!.interruptGenerate();
+            callbacks.onAbort();
+            throw new Error("Request aborted");
+          }
 
-        // 复读检测：若检测到严重重复则中断，返回已有内容
-        if (detector.isRepeating()) {
-          console.warn("[Offscreen] Repetition detected in chatCompletion, interrupting. requestId:", requestId);
-          await engine.interruptGenerate();
-          break;
+          const delta = chunk.choices[0]?.delta?.content;
+          if (delta) {
+            content += delta;
+            detector.feed(delta);
+
+            // 复读检测
+            if (detector.isRepeating()) {
+              console.warn("[Offscreen] Repetition detected, interrupting. requestId:", requestId);
+              await engine!.interruptGenerate();
+              callbacks.onDone(usage);
+              return { content, usage };
+            }
+
+            callbacks.onChunk(delta);
+          }
+
+          if (chunk.usage) {
+            usage = chunk.usage;
+          }
         }
-      }
 
-      if (chunk.usage) {
-        usage = chunk.usage;
-      }
-    }
+        callbacks.onDone(usage);
 
-    return { content, usage };
+        return { content, usage };
+      })(),
+      timeoutPromise,
+    ]);
 
   } finally {
+    clearTimeout(timeoutTimer!);
     activeRequests.delete(requestId);
+
+    // 超时或取消后重置 KV cache，确保后续请求正常
+    if (timedOut || aborted) {
+      try {
+        await engine?.resetChat();
+        console.log("[Offscreen] Engine chat reset after interruption. requestId:", requestId);
+      } catch (e) {
+        console.warn("[Offscreen] Failed to reset chat after interruption:", e);
+      }
+    }
   }
 }
 
-// ==================== 超时工具函数 ====================
+// ==================== Chat Completion （非流式封装） ====================
 
-const STREAM_TIMEOUT_MS = 60000; // 60秒超时
-const CHUNK_TIMEOUT_MS = 30000; // 单个 chunk 超时 30 秒
-
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operation: string): Promise<T> {
-  return Promise.race([
-    promise,
-    new Promise<T>((_, reject) => 
-      setTimeout(() => reject(new Error(`${operation} timeout after ${timeoutMs}ms`)), timeoutMs)
-    )
-  ]);
+/**
+ * 非流式 chat —— 内部流式生成 + 复读检测，完成后一次性返回结果。
+ */
+async function chatCompletion(
+  requestId: string,
+  messages: ChatCompletionMessageParam[]
+): Promise<{ content: string; usage?: any }> {
+  return generateCore(requestId, messages, {
+    onChunk: () => {},                       // 不需要逐 chunk 处理
+    onDone: () => {},                        // 由返回值传递结果
+    onAbort: () => {},                       // 由 throw 传递错误
+  }, MILD_REPEAT_CONFIG);
 }
 
-// ==================== Streaming Chat Completion ====================
+// ==================== Streaming Chat Completion （流式封装） ====================
 
+/**
+ * 流式 chat —— 每个 token 实时推送到 background。
+ */
 async function chatCompletionStream(
   requestId: string,
   messages: ChatCompletionMessageParam[]
@@ -269,163 +331,33 @@ async function chatCompletionStream(
     return;
   }
 
-  // 注册请求
-  activeRequests.set(requestId, { aborted: false });
-
   try {
-    const completion = await withTimeout(
-      engine.chat.completions.create({
-        stream: true,
-        messages: messages,
-        stream_options: { include_usage: true },
-        // ...ANTI_REPEAT_CONFIG,
-      }),
-      STREAM_TIMEOUT_MS,
-      "Chat completion create"
-    );
-
-    let usage = null;
-    let lastChunkTime = Date.now();
-    const detector = new RepetitionDetector();
-
-    for await (const chunk of completion) {
-      // 检查是否已取消
-      if (activeRequests.get(requestId)?.aborted) {
-        await engine.interruptGenerate();
-        chrome.runtime.sendMessage({
-          type: "STREAM_CHUNK",
-          data: { requestId, error: "Request aborted", done: true }
-        });
-        return;
-      }
-
-      // 检查 chunk 间隔超时
-      const now = Date.now();
-      lastChunkTime = now;
-
-      const delta = chunk.choices[0]?.delta?.content;
-      if (delta) {
-        detector.feed(delta);
-
-        // 复读检测：若检测到严重重复则中断生成
-        if (detector.isRepeating()) {
-          console.warn("[Offscreen] Repetition detected, interrupting generation for request:", requestId);
-          await engine.interruptGenerate();
-          chrome.runtime.sendMessage({
-            type: "STREAM_CHUNK",
-            data: { requestId, chunk: "\n\n[... 检测到重复内容，已自动停止生成]", done: false }
-          }).catch(() => {});
-          // 发送完成信号
-          chrome.runtime.sendMessage({
-            type: "STREAM_CHUNK",
-            data: { requestId, done: true, usage }
-          }).catch(() => {});
-          return;
-        }
-
-        // 发送 chunk 到 background
+    await generateCore(requestId, messages, {
+      onChunk: (delta) => {
         chrome.runtime.sendMessage({
           type: "STREAM_CHUNK",
           data: { requestId, chunk: delta }
         }).catch(() => {});
-      }
-
-      // 获取使用统计（在最后一个 chunk 中）
-      if (chunk.usage) {
-        usage = chunk.usage;
-      }
-    }
-
-    // 发送完成信号
-    chrome.runtime.sendMessage({
-      type: "STREAM_CHUNK",
-      data: { requestId, done: true, usage }
-    }).catch(() => {});
-
+      },
+      onDone: (usage) => {
+        chrome.runtime.sendMessage({
+          type: "STREAM_CHUNK",
+          data: { requestId, done: true, usage }
+        }).catch(() => {});
+      },
+      onAbort: () => {
+        chrome.runtime.sendMessage({
+          type: "STREAM_CHUNK",
+          data: { requestId, error: "Request aborted", done: true }
+        }).catch(() => {});
+      },
+    });
   } catch (err) {
-    console.error("[Offscreen] Stream error:", err);
+    console.warn("[Offscreen] Stream error:", err);
     chrome.runtime.sendMessage({
       type: "STREAM_CHUNK",
       data: { requestId, error: String(err), done: true }
     }).catch(() => {});
-
-  } finally {
-    activeRequests.delete(requestId);
-  }
-}
-
-// ==================== 页面摘要 ====================
-
-async function summarizePage(
-  url: string,
-  title: string,
-  content: string
-): Promise<{ summary: string }> {
-  if (!engine || !engineReady) {
-    throw new Error("Engine not ready");
-  }
-
-  console.log("[Offscreen] Summarizing page:", title);
-
-  const requestId = `summarize_${Date.now()}`;
-  activeRequests.set(requestId, { aborted: false });
-
-  const messages: ChatCompletionMessageParam[] = [
-    {
-      role: "system",
-      content: "You are a helpful assistant that summarizes web pages. Create a concise summary with key points (5-10 bullet points). Focus on: main topics, key facts, important details, and actionable information. Be brief but comprehensive."
-    },
-    {
-      role: "user",
-      content: `Summarize this webpage:\n\nTitle: ${title}\n\nContent:\n${content}`
-    }
-  ];
-
-  try {
-    let summary = "";
-    const completion = await withTimeout(
-      engine.chat.completions.create({
-        stream: true,
-        messages: messages,
-        ...ANTI_REPEAT_CONFIG,
-      }),
-      STREAM_TIMEOUT_MS,
-      "Summarize completion create"
-    );
-
-    let lastChunkTime = Date.now();
-    const detector = new RepetitionDetector();
-
-    for await (const chunk of completion) {
-      // 检查是否已取消
-      if (activeRequests.get(requestId)?.aborted) {
-        await engine.interruptGenerate();
-        throw new Error("Request aborted");
-      }
-
-      // 检查 chunk 间隔超时
-      const now = Date.now();
-      lastChunkTime = now;
-
-      const delta = chunk.choices[0]?.delta?.content;
-      if (delta) {
-        summary += delta;
-
-        // 复读检测：若检测到严重重复则中断
-        detector.feed(delta);
-        if (detector.isRepeating()) {
-          console.warn("[Offscreen] Repetition detected during summarization, stopping.");
-          await engine.interruptGenerate();
-          break;
-        }
-      }
-    }
-
-    console.log("[Offscreen] Summary generated:", summary.length, "chars");
-    return { summary };
-
-  } finally {
-    activeRequests.delete(requestId);
   }
 }
 
@@ -478,13 +410,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case "CHAT_COMPLETION_STREAM":
       chatCompletionStream(message.data.requestId, message.data.messages)
         .then(() => sendResponse({ status: "streaming" }))
-        .catch(err => sendResponse({ error: String(err) }));
-      return true;
-
-    case "SUMMARIZE_PAGE":
-      const { url, title, content } = message.data;
-      summarizePage(url, title, content)
-        .then(result => sendResponse(result))
         .catch(err => sendResponse({ error: String(err) }));
       return true;
 

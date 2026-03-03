@@ -342,11 +342,17 @@ async function handleClick() {
   try {
     // 一次请求：background 自行收集标签页内容 + 多标签页处理 + streaming 输出
     await processAndStream(message);
+    // 超时等场景下可能没有任何 chunk 产出，给出提示
+    if (!document.getElementById("answer")!.innerHTML) {
+      document.getElementById("answer")!.innerHTML = "timeout";
+    }
   } catch (err) {
     console.error("[Sidebar] Chat error:", err);
+    document.getElementById("answer")!.innerHTML = `Error: ${err}`;
+  } finally {
+    // 无论成功/失败/超时，都确保隐藏 loading 并冻结计时器
     freezeTimer();
     document.getElementById("loading-indicator")!.style.display = "none";
-    document.getElementById("answer")!.innerHTML = `Error: ${err}`;
   }
 }
 
