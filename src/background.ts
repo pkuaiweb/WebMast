@@ -40,7 +40,7 @@ interface StreamChunk {
 }
 
 interface EngineInitResult {
-  status: "ready" | "initializing" | "error" ;
+  status: "ready" | "initializing" | "error";
   modelId: string;
   error?: string;
 }
@@ -132,7 +132,7 @@ async function ensureOffscreenDocument(): Promise<boolean> {
 
 async function initializeEngine(forceModelId?: string): Promise<EngineInitResult> {
   const modelId = forceModelId || currentModelId;
-  
+
   if (offscreenEngineReady && !forceModelId) {
     return { status: "ready", modelId };
   }
@@ -198,14 +198,14 @@ async function saveCachedSummary(data: SummaryData): Promise<void> {
 async function getAllCachedSummaries(): Promise<{ [url: string]: SummaryData }> {
   const allData = await chrome.storage.local.get(null);
   const summaries: { [url: string]: SummaryData } = {};
-  
+
   for (const key of Object.keys(allData)) {
     if (key.startsWith(SUMMARY_CACHE_PREFIX)) {
       const url = key.replace(SUMMARY_CACHE_PREFIX, "");
       summaries[url] = allData[key] as SummaryData;
     }
   }
-  
+
   return summaries;
 }
 
@@ -246,6 +246,7 @@ async function fetchAllTabContents(): Promise<TabContentInfo[]> {
         const cachedSummary = await getCachedSummary(tabUrl);
 
         results.push({
+          index: tab.index ?? 0,
           title: tab.title || "Untitled",
           url: tabUrl,
           content: response.contents,
@@ -260,7 +261,7 @@ async function fetchAllTabContents(): Promise<TabContentInfo[]> {
       console.warn(`[Background] Failed to get content from tab ${tab.id} (${tab.url}):`, error);
     }
   });
-
+  console.log(results);
   await Promise.all(promises);
   return results;
 }
@@ -268,6 +269,7 @@ async function fetchAllTabContents(): Promise<TabContentInfo[]> {
 // ==================== 多标签页处理逻辑 ====================
 
 interface TabContentInfo {
+  index: number;
   title: string;
   url: string;
   content: string;
@@ -288,7 +290,7 @@ interface MultiTabQueryResult {
 function parseSummaryResponse(response: string): { sufficient: boolean; answer: string } {
   console.log("[Background] Parsing summary response:", response);
   const normalized = response.toLowerCase();
-  
+
   // 检查 SUFFICIENT 字段
   const sufficientMatch = normalized.match(/\*{0,2}sufficient\*{0,2}:\s*(yes|no)/i);
   const isSufficient = sufficientMatch ? sufficientMatch[1].toLowerCase() === "yes" : false;
@@ -299,16 +301,16 @@ function parseSummaryResponse(response: string): { sufficient: boolean; answer: 
   }
 
   // 提取 ANSWER 字段
-  const answerMatch = response.match(/\*{0,2}answer\*{0,2}:\s*([\s\S]*)/i);  
+  const answerMatch = response.match(/\*{0,2}answer\*{0,2}:\s*([\s\S]*)/i);
 
   if (!sufficientMatch || !answerMatch) {
     // 模型未遵循格式，将整个响应作为答案
     return { sufficient: true, answer: response.trim() };
   }
-    let answer = answerMatch[1].trim();
-    // 去除多余的星号（模型可能忽略格式要求）
-    answer = answer.replace(/^\*+|\*+$/g, "").trim();
-    return { sufficient: isSufficient, answer };
+  let answer = answerMatch[1].trim();
+  // 去除多余的星号（模型可能忽略格式要求）
+  answer = answer.replace(/^\*+|\*+$/g, "").trim();
+  return { sufficient: isSufficient, answer };
 }
 
 // 如果模型是 Qwen3，在最后一条 user 消息末尾追加 /nothink
@@ -377,30 +379,32 @@ function isIrrelevantAnswer(text: string): boolean {
 async function answerFromContent(
   content: string,
   question: string,
+  index: number,
   activeRequests?: Set<string>
 ): Promise<string> {
   const messages = [
     {
       role: "system",
       content: [
-        "You are extracting information from ONE web page that is part of a multi-tab browsing session.",
-        "The user's question may span multiple tabs. Your job is to extract ANY relevant partial information from THIS page's content.",
+        `You are extracting information from the content of tab ${index}.`,
+        `Focus ONLY on the content provided below. Do NOT reference or speculate about other tabs.`,
         "",
         "Rules:",
         "- If the content contains ANY data related to the question (prices, names, quantities, dates, etc.), extract and present it as concise bullet points.",
         "- ALWAYS include exact numbers (review counts, ratings, prices, quantities) in your extraction — these are critical for filtering.",
         "- Even a single relevant data point (e.g. one product's price) counts as relevant — extract it.",
-        "- Only say 'N/A' if the content is COMPLETELY unrelated to the question.",
-        "- Do NOT say N/A just because the page alone cannot fully answer the question.",
+        // "- Only say 'N/A' if the content is COMPLETELY unrelated to the question.",
+        // "- Do NOT say N/A just because this tab alone cannot fully answer the question.",
+        "- Do NOT mention or refer to any other tabs. Only describe what is in THIS content.",
         "- No conversational filler."
       ].join("\n")
     },
     {
       role: "user",
-      content: `CONTENT: ${content.substring(0, CONFIG.maxContentLength)}\nQUESTION: ${question}\nANSWER:`
+      content: `Content of tab ${index}:\n${content.substring(0, CONFIG.maxContentLength)}\n\nQUESTION: ${question}`
     }
   ];
-  
+
   return silentChat(messages, activeRequests);
 }
 
@@ -410,12 +414,12 @@ async function processMultiTabQuery(
   userMessage: string,
   activeRequests?: Set<string>
 ): Promise<MultiTabQueryResult> {
-  
+
   if (allTabContents.length <= 1) {
     // 单个标签页或无标签页，使用简单逻辑
     const pageContext = allTabContents
-      .map((tabInfo, index) =>
-        `=== Tab ${index + 1}: ${tabInfo.title} ===\nURL: ${tabInfo.url}\n\n${tabInfo.content}\n\n`
+      .map((tabInfo) =>
+        `=== Tab ${tabInfo.index}: ${tabInfo.title} ===\nURL: ${tabInfo.url}\n\n${tabInfo.content}\n\n`
       )
       .join("\n");
 
@@ -426,7 +430,7 @@ async function processMultiTabQuery(
           role: "system",
           content: `You are a helpful assistant. Here is the content of the browser tab:\n\n${pageContext}\n\nPlease answer questions about this webpage. Keep your response concise and do NOT repeat the same information.`
         },
-        { role: "user", content: userMessage }
+        { role: "user", content: `QUESTION: ${userMessage}` }
       ]
     };
   }
@@ -434,16 +438,17 @@ async function processMultiTabQuery(
   console.log(`[Background] Processing ${allTabContents.length} tabs...`);
 
   // Phase 1: 对每个标签页，使用摘要或原始内容回答问题
-  const compressedTabContents: { 
-    title: string; 
-    url: string; 
-    compressed: string; 
-    isRelevant: boolean 
+  const compressedTabContents: {
+    index: number;
+    title: string;
+    url: string;
+    compressed: string;
+    isRelevant: boolean
   }[] = [];
 
   for (let i = 0; i < allTabContents.length; i++) {
     const tabInfo = allTabContents[i];
-    console.log(`[Background] Processing tab ${i + 1}/${allTabContents.length}: ${tabInfo.title}`);
+    console.log(`[Background] Processing tab ${tabInfo.index}/${allTabContents.length}: ${tabInfo.title}`);
 
     let compressedContent = "";
     let isRelevant = true;
@@ -451,7 +456,7 @@ async function processMultiTabQuery(
     if (USE_SUMMARY_CACHE && tabInfo.hasCachedSummary && tabInfo.cachedSummary) {
       // 使用缓存的摘要
       console.log(`[Background] Using cached summary for: ${tabInfo.title}`);
-      
+
       const summaryMessages = [
         {
           role: "system",
@@ -486,18 +491,19 @@ async function processMultiTabQuery(
       try {
         const summaryResponse = await silentChat(summaryMessages, activeRequests);
         const parsedResult = parseSummaryResponse(summaryResponse);
-        
+
         if (parsedResult.sufficient) {
           compressedContent = parsedResult.answer;
           isRelevant = !isIrrelevantAnswer(compressedContent);
         } else {
           // 摘要不够，使用原始内容
-          
-          compressedContent = await answerFromContent(tabInfo.content, userMessage, activeRequests);
+
+          compressedContent = await answerFromContent(tabInfo.content, userMessage, tabInfo.index, activeRequests);
           console.log(`[Background] Insufficient for: ${tabInfo.title}, answerFromContent: ${compressedContent}`);
           isRelevant = !isIrrelevantAnswer(compressedContent);
         }
       } catch (err) {
+        if (err instanceof Error && err.message.includes("Port disconnected")) throw err;
         console.error(`[Background] Error processing tab ${tabInfo.title}:`, err);
         compressedContent = "Error processing this tab";
         isRelevant = false;
@@ -505,10 +511,11 @@ async function processMultiTabQuery(
     } else {
       // 无缓存摘要，直接使用原始内容
       try {
-        compressedContent = await answerFromContent(tabInfo.content, userMessage, activeRequests);
+        compressedContent = await answerFromContent(tabInfo.content, userMessage, tabInfo.index, activeRequests);
         console.log(`[Background] answerFromContent: ${compressedContent}`);
         // isRelevant = !isIrrelevantAnswer(compressedContent);
       } catch (err) {
+        if (err instanceof Error && err.message.includes("Port disconnected")) throw err;
         console.error(`[Background] Error processing tab ${tabInfo.title}:`, err);
         compressedContent = "Error processing this tab";
         isRelevant = false;
@@ -516,6 +523,7 @@ async function processMultiTabQuery(
     }
 
     compressedTabContents.push({
+      index: tabInfo.index,
       title: tabInfo.title,
       url: tabInfo.url,
       compressed: compressedContent,
@@ -528,8 +536,8 @@ async function processMultiTabQuery(
   console.log(`[Background] Found ${relevantTabs.length} relevant tabs`);
 
   const combinedContext = relevantTabs
-    .map((tabInfo, index) =>
-      `=== Tab ${index + 1}: ${tabInfo.title} ===\nURL: ${tabInfo.url}\nRelevant Information: ${tabInfo.compressed}\n`
+    .map((tabInfo) =>
+      `=== Tab ${tabInfo.index}: ${tabInfo.title} ===\nURL: ${tabInfo.url}\nContent: ${tabInfo.compressed}\n`
     )
     .join("\n");
 
@@ -539,10 +547,12 @@ async function processMultiTabQuery(
       {
         role: "system",
         content: relevantTabs.length > 0
-          ? `You are a helpful assistant. The user has ${allTabContents.length} browser tabs open. Below is the relevant information extracted from ${relevantTabs.length} relevant tabs:\n\n${combinedContext}\n\nPlease provide a comprehensive answer. Be concise and NEVER repeat the same sentence, phrase, or point.`
+          ? `You are a helpful assistant. Below is the content from ${relevantTabs.length} tabs:\n\n${combinedContext}\n\n`
+          + `Instructions:\n- answer the question strictly based on the content from tabs. Do not add assumptions.\n`
+          + `- Be concise and NEVER repeat the same sentence, phrase, or point.`
           : `You are a helpful assistant. The user has ${allTabContents.length} browser tabs open, but none contain relevant information. Please let the user know briefly.`
       },
-      { role: "user", content: userMessage }
+      { role: "user", content: `QUESTION: ${userMessage}` }
     ]
   };
 }
@@ -707,28 +717,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ success: false, error: "No model ID provided" });
         return true;
       }
-      
+
       if (newModelId === currentModelId && offscreenEngineReady) {
         sendResponse({ success: true, status: "same_model" });
         return true;
       }
-      
+
       // Save to storage and reinitialize
       currentModelId = newModelId;
       offscreenEngineReady = false;
       engineInitProgress = 0;
       isEngineInitializing = true;  // Set IMMEDIATELY to prevent race with INIT_ENGINE_REQUEST
-      
+
       // Save to storage (fire and forget)
-      saveModelIdToStorage(newModelId).catch(err => 
+      saveModelIdToStorage(newModelId).catch(err =>
         console.error("[Background] Failed to save model ID:", err)
       );
-      
+
       // 立即返回响应，让 popup 可以开始轮询进度
       sendResponse({ success: true, status: "loading", modelId: newModelId });
-      
+
       // 异步初始化引擎（不等待完成）
-      initializeEngine(newModelId).catch(err => 
+      initializeEngine(newModelId).catch(err =>
         console.error("[Background] Engine init failed:", err)
       );
       return true;
@@ -750,7 +760,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case "PAGE_LOADED": {
       const { url, title, content } = message.data;
       console.log("[Background] PAGE_LOADED:", title, "length:", content?.length);
-      
+
       if (USE_SUMMARY_CACHE && content && content.length > CONFIG.minContentLength) {
         queuePageForSummarization(url, title, content).then(() => {
           sendResponse({ status: "queued" });
@@ -920,10 +930,10 @@ chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
 loadModelIdFromStorage().then(savedModelId => {
   currentModelId = savedModelId;
   console.log("[Background] Loaded model ID from storage:", currentModelId);
-  
+
   ensureOffscreenDocument().then(() => {
     console.log("[Background] Offscreen document ready, checking engine status...");
-    
+
     // 先查询 offscreen 当前状态（应对 background 重启但 offscreen 仍运行的场景）
     chrome.runtime.sendMessage({ type: "CHECK_ENGINE_STATUS" }, (statusResponse) => {
       if (!chrome.runtime.lastError && statusResponse?.ready && statusResponse?.modelId === currentModelId) {
