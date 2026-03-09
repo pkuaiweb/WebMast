@@ -342,16 +342,11 @@ async function silentChat(
     // 注册 reject 回调用于取消
     pendingRejects.set(requestId, reject);
 
-    const cleanup = () => {
-      // activeRequests?.delete(requestId);
-      pendingRejects.delete(requestId);
-    };
-
     chrome.runtime.sendMessage({
       type: "CHAT_COMPLETION",
       data: { requestId, messages }
     }, (response) => {
-      cleanup();
+      pendingRejects.delete(requestId);
       if (chrome.runtime.lastError) {
         reject(new Error(chrome.runtime.lastError.message));
       } else if (response?.success) {

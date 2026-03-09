@@ -22,7 +22,7 @@ let engineReady = false;
 let currentModelId = "";
 
 // 请求管理（用于取消）
-const activeRequests = new Map<string, { aborted: boolean }>();
+// const activeRequests = new Map<string, { aborted: boolean }>();
 
 // ==================== 抗复读配置 ====================
 
@@ -111,15 +111,6 @@ async function initEngine(modelId: string) {
   // If a different model is requested, we need to unload the current engine
   if (engine && currentModelId !== modelId) {
     console.log("[Offscreen] Switching model from", currentModelId, "to", modelId);
-
-    // Cancel all active requests
-    for (const [requestId] of activeRequests) {
-      const request = activeRequests.get(requestId);
-      if (request) {
-        request.aborted = true;
-      }
-    }
-    activeRequests.clear();
 
     // Unload current engine
     try {
@@ -213,7 +204,7 @@ async function generateCore(
     throw new Error("Engine not ready");
   }
 
-  activeRequests.set(requestId, { aborted: false });
+  // activeRequests.set(requestId, { aborted: false });
 
   let content = "";
   let usage: any = null;
@@ -239,7 +230,7 @@ async function generateCore(
       usage = chunk.usage;
     }
   }
-  activeRequests.delete(requestId);
+  // activeRequests.delete(requestId);
   callbacks.onDone(usage);
 
   return { content, usage };
@@ -310,24 +301,11 @@ async function chatCompletionStream(
 
 // ==================== 请求取消 ====================
 
-function abortRequest(requestId: string) {
-  const request = activeRequests.get(requestId);
-  if (request) {
-    request.aborted = true;
-    console.log("[Offscreen] Request aborted:", requestId);
-  }
-}
 
 // ==================== 重置引擎 ====================
 
 async function resetEngine() {
   if (engine) {
-    // 取消所有活跃请求
-    for (const [requestId] of activeRequests) {
-      abortRequest(requestId);
-    }
-    activeRequests.clear();
-
     // 重置聊天
     await engine.resetChat();
     console.log("[Offscreen] Engine chat reset");
@@ -361,7 +339,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return true;
 
     case "ABORT_REQUEST":
-      abortRequest(message.data.requestId);
+      // abortRequest(message.data.requestId);
       sendResponse({ status: "aborted" });
       return true;
 
