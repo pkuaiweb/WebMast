@@ -101,7 +101,7 @@ async function initEngine(modelId: string) {
     console.log("[Offscreen] Engine already initialized with model:", modelId);
     return { status: "ready" };
   }
-  
+
   // If initializing the same model, return initializing status
   if (isEngineInitializing && currentModelId === modelId) {
     console.log("[Offscreen] Engine already initializing with model:", modelId);
@@ -111,7 +111,7 @@ async function initEngine(modelId: string) {
   // If a different model is requested, we need to unload the current engine
   if (engine && currentModelId !== modelId) {
     console.log("[Offscreen] Switching model from", currentModelId, "to", modelId);
-    
+
     // Cancel all active requests
     for (const [requestId] of activeRequests) {
       const request = activeRequests.get(requestId);
@@ -120,7 +120,7 @@ async function initEngine(modelId: string) {
       }
     }
     activeRequests.clear();
-    
+
     // Unload current engine
     try {
       await engine.unload();
@@ -128,7 +128,7 @@ async function initEngine(modelId: string) {
     } catch (err) {
       console.warn("[Offscreen] Error unloading engine:", err);
     }
-    
+
     engine = null;
     engineReady = false;
   }
@@ -146,12 +146,12 @@ async function initEngine(modelId: string) {
         // "Loading model from cache[2/2]: ..." (加载权重)
         // 或 "Fetching param cache[1/x]: ..." (下载时)
         console.log("[Offscreen] Engine init progress:", Math.round(progress * 100) + "%", "-", report.text);
-        
+
         // 通知 background 进度
         chrome.runtime.sendMessage({
           type: "ENGINE_INIT_PROGRESS",
           data: { progress, text: report.text }
-        }).catch(() => {});
+        }).catch(() => { });
       }
     });
 
@@ -162,17 +162,17 @@ async function initEngine(modelId: string) {
     chrome.runtime.sendMessage({
       type: "ENGINE_READY",
       data: { modelId }
-    }).catch(() => {});
+    }).catch(() => { });
 
     return { status: "ready" };
 
   } catch (err) {
     console.error("[Offscreen] Failed to initialize engine:", err);
-    
+
     chrome.runtime.sendMessage({
       type: "ENGINE_ERROR",
       data: { error: String(err) }
-    }).catch(() => {});
+    }).catch(() => { });
 
     return { status: "error", error: String(err) };
 
@@ -215,87 +215,34 @@ async function generateCore(
 
   activeRequests.set(requestId, { aborted: false });
 
-  let timedOut = false;
-  let aborted = false;
   let content = "";
   let usage: any = null;
-  let timeoutTimer: ReturnType<typeof setTimeout>;
-  const timeoutPromise = new Promise<{ content: string; usage?: any }>((resolve) => {
-    timeoutTimer = setTimeout(() => {
-      timedOut = true;
-      console.warn("[Offscreen] generateCore timeout, interrupting. requestId:", requestId);
-      engine!.interruptGenerate();
-      // 超时也调用 onDone，返回已生成的部分内容
-      callbacks.onDone(usage);
-      resolve({ content, usage });
-    }, STREAM_TIMEOUT_MS);
+  const completion = await engine!.chat.completions.create({
+    stream: true,
+    messages,
+    stream_options: { include_usage: true },
+    ...extraCreateParams,
   });
 
-  try {
-    return await Promise.race([
-      (async (): Promise<{ content: string; usage?: any }> => {
-        const completion = await engine!.chat.completions.create({
-          stream: true,
-          messages,
-          stream_options: { include_usage: true },
-          ...extraCreateParams,
-        });
+  // const detector = new RepetitionDetector();
 
-        const detector = new RepetitionDetector();
+  for await (const chunk of completion) {
 
-        for await (const chunk of completion) {
-          if (timedOut) break;
+    const delta = chunk.choices[0]?.delta?.content;
+    if (delta) {
+      content += delta;
+      // detector.feed(delta);
+      callbacks.onChunk(delta);
+    }
 
-          // 检查 abort
-          if (activeRequests.get(requestId)?.aborted) {
-            aborted = true;
-            await engine!.interruptGenerate();
-            callbacks.onAbort();
-            throw new Error("Request aborted");
-          }
-
-          const delta = chunk.choices[0]?.delta?.content;
-          if (delta) {
-            content += delta;
-            detector.feed(delta);
-
-            // 复读检测
-            if (detector.isRepeating()) {
-              console.warn("[Offscreen] Repetition detected, interrupting. requestId:", requestId);
-              await engine!.interruptGenerate();
-              callbacks.onDone(usage);
-              return { content, usage };
-            }
-
-            callbacks.onChunk(delta);
-          }
-
-          if (chunk.usage) {
-            usage = chunk.usage;
-          }
-        }
-
-        callbacks.onDone(usage);
-
-        return { content, usage };
-      })(),
-      timeoutPromise,
-    ]);
-
-  } finally {
-    clearTimeout(timeoutTimer!);
-    activeRequests.delete(requestId);
-
-    // 超时或取消后重置 KV cache，确保后续请求正常
-    if (timedOut || aborted) {
-      try {
-        await engine?.resetChat();
-        console.log("[Offscreen] Engine chat reset after interruption. requestId:", requestId);
-      } catch (e) {
-        console.warn("[Offscreen] Failed to reset chat after interruption:", e);
-      }
+    if (chunk.usage) {
+      usage = chunk.usage;
     }
   }
+  activeRequests.delete(requestId);
+  callbacks.onDone(usage);
+
+  return { content, usage };
 }
 
 // ==================== Chat Completion （非流式封装） ====================
@@ -308,9 +255,9 @@ async function chatCompletion(
   messages: ChatCompletionMessageParam[]
 ): Promise<{ content: string; usage?: any }> {
   return generateCore(requestId, messages, {
-    onChunk: () => {},                       // 不需要逐 chunk 处理
-    onDone: () => {},                        // 由返回值传递结果
-    onAbort: () => {},                       // 由 throw 传递错误
+    onChunk: () => { },                       // 不需要逐 chunk 处理
+    onDone: () => { },                        // 由返回值传递结果
+    onAbort: () => { },                       // 由 throw 传递错误
   }, MILD_REPEAT_CONFIG);
 }
 
@@ -337,19 +284,19 @@ async function chatCompletionStream(
         chrome.runtime.sendMessage({
           type: "STREAM_CHUNK",
           data: { requestId, chunk: delta }
-        }).catch(() => {});
+        }).catch(() => { });
       },
       onDone: (usage) => {
         chrome.runtime.sendMessage({
           type: "STREAM_CHUNK",
           data: { requestId, done: true, usage }
-        }).catch(() => {});
+        }).catch(() => { });
       },
       onAbort: () => {
         chrome.runtime.sendMessage({
           type: "STREAM_CHUNK",
           data: { requestId, error: "Request aborted", done: true }
-        }).catch(() => {});
+        }).catch(() => { });
       },
     });
   } catch (err) {
@@ -357,7 +304,7 @@ async function chatCompletionStream(
     chrome.runtime.sendMessage({
       type: "STREAM_CHUNK",
       data: { requestId, error: String(err), done: true }
-    }).catch(() => {});
+    }).catch(() => { });
   }
 }
 
