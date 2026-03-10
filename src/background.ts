@@ -376,14 +376,15 @@ function isIrrelevantAnswer(text: string): boolean {
   return negativePatterns.test(t);
 }
 
-// 从内容中回答问题
-async function answerFromContent(
+// ==================== Prompt 构建函数 ====================
+
+// Prompt: 从单个标签页内容中提取与问题相关的信息
+function buildExtractFromContentPrompt(
   content: string,
   question: string,
-  index: number,
-  port: chrome.runtime.Port
-): Promise<string> {
-  const messages = [
+  index: number
+): Array<{ role: string; content: string }> {
+  return [
     {
       role: "system",
       content: [
@@ -405,8 +406,99 @@ async function answerFromContent(
       content: `Content of tab ${index}:\n${content.substring(0, CONFIG.maxContentLength)}\n\nQUESTION: ${question}`
     }
   ];
+}
 
-  return silentChat(messages, port);
+// Prompt: 单标签页问答
+function buildSingleTabPrompt(
+  pageContext: string,
+  userMessage: string
+): Array<{ role: string; content: string }> {
+  return [
+    {
+      role: "system",
+      content: `You are a helpful assistant. Here is the content of the browser tab:\n\n${pageContext}\n\nPlease answer questions about this webpage. Keep your response concise and do NOT repeat the same information.`
+    },
+    { role: "user", content: `QUESTION: ${userMessage}` }
+  ];
+}
+
+// Prompt: 评估摘要是否足以回答问题
+function buildSummaryEvaluationPrompt(
+  cachedSummary: string,
+  userMessage: string
+): Array<{ role: string; content: string }> {
+  return [
+    {
+      role: "system",
+      content: [
+        "You are evaluating whether a page summary contains enough information to answer a question.",
+        "",
+        "CRITICAL RULES:",
+        "1. Identify ALL constraints or conditions stated in the question (comparisons, thresholds, superlatives, categories, etc.).",
+        "2. A constraint is met ONLY when the summary provides an explicit value that satisfies it. Never assume a constraint is met if the relevant data is missing or ambiguous.",
+        "3. In your ANSWER, always state the key facts you extracted so downstream reasoning can double-check them.",
+        "",
+        "You MUST follow one of these three response formats exactly (no markdown, no asterisks, no extra text):",
+        "",
+        "Case 1 – Summary is sufficient to answer the question:",
+        "SUFFICIENT: yes",
+        "ANSWER: <concise answer with the key facts extracted from the summary>",
+        "",
+        "Case 2 – Summary is relevant to the question but lacks enough detail to verify all constraints:",
+        "SUFFICIENT: no",
+        "",
+        "Case 3 – Summary is completely unrelated to the question:",
+        "SUFFICIENT: yes",
+        "ANSWER: N/A"
+      ].join("\n")
+    },
+    {
+      role: "user",
+      content: `SUMMARY: ${cachedSummary}\n\nQUESTION: ${userMessage}`
+    }
+  ];
+}
+
+// Prompt: 多标签页合并结果后的最终问答
+function buildMultiTabFinalPrompt(
+  relevantTabs: Array<{ index: number; title: string; url: string; compressed: string }>,
+  totalTabCount: number,
+  userMessage: string
+): Array<{ role: string; content: string }> {
+  const combinedContext = relevantTabs
+    .map((tabInfo) =>
+      `=== Tab ${tabInfo.index}: ${tabInfo.title} ===\nURL: ${tabInfo.url}\nContent: ${tabInfo.compressed}\n`
+    )
+    .join("\n");
+
+  return [
+    {
+      role: "system",
+      content: relevantTabs.length > 0
+        ? `You are a helpful assistant. Below is the content from ${relevantTabs.length} tabs:\n\n${combinedContext}\n\n`
+        + `Instructions:\n- answer the question strictly based on the content from tabs. Do not add assumptions.\n`
+        + `- Be concise and NEVER repeat the same sentence, phrase, or point.`
+        : `You are a helpful assistant. The user has ${totalTabCount} browser tabs open, but none contain relevant information. Please let the user know briefly.`
+    },
+    { role: "user", content: `QUESTION: ${userMessage}` }
+  ];
+}
+
+// Prompt: 页面摘要生成
+function buildSummarizePagePrompt(
+  title: string,
+  content: string
+): Array<{ role: string; content: string }> {
+  return [
+    {
+      role: "system",
+      content: "You are a helpful assistant that summarizes web pages. Create a concise summary with key points (5-10 bullet points). Focus on: main topics, key facts, important details, and actionable information. Be brief but comprehensive."
+    },
+    {
+      role: "user",
+      content: `Summarize this webpage:\n\nTitle: ${title}\n\nContent:\n${content}`
+    }
+  ];
 }
 
 // 处理多标签页查询 - 核心逻辑
@@ -426,13 +518,7 @@ async function processMultiTabQuery(
 
     return {
       success: true,
-      finalMessages: [
-        {
-          role: "system",
-          content: `You are a helpful assistant. Here is the content of the browser tab:\n\n${pageContext}\n\nPlease answer questions about this webpage. Keep your response concise and do NOT repeat the same information.`
-        },
-        { role: "user", content: `QUESTION: ${userMessage}` }
-      ]
+      finalMessages: buildSingleTabPrompt(pageContext, userMessage)
     };
   }
 
@@ -458,36 +544,7 @@ async function processMultiTabQuery(
       // 使用缓存的摘要
       console.log(`[Background] Using cached summary for: ${tabInfo.title}`);
 
-      const summaryMessages = [
-        {
-          role: "system",
-          content: [
-            "You are evaluating whether a page summary contains enough information to answer a question.",
-            "",
-            "CRITICAL RULES:",
-            "1. Identify ALL constraints or conditions stated in the question (comparisons, thresholds, superlatives, categories, etc.).",
-            "2. A constraint is met ONLY when the summary provides an explicit value that satisfies it. Never assume a constraint is met if the relevant data is missing or ambiguous.",
-            "3. In your ANSWER, always state the key facts you extracted so downstream reasoning can double-check them.",
-            "",
-            "You MUST follow one of these three response formats exactly (no markdown, no asterisks, no extra text):",
-            "",
-            "Case 1 – Summary is sufficient to answer the question:",
-            "SUFFICIENT: yes",
-            "ANSWER: <concise answer with the key facts extracted from the summary>",
-            "",
-            "Case 2 – Summary is relevant to the question but lacks enough detail to verify all constraints:",
-            "SUFFICIENT: no",
-            "",
-            "Case 3 – Summary is completely unrelated to the question:",
-            "SUFFICIENT: yes",
-            "ANSWER: N/A"
-          ].join("\n")
-        },
-        {
-          role: "user",
-          content: `SUMMARY: ${tabInfo.cachedSummary}\n\nQUESTION: ${userMessage}`
-        }
-      ];
+      const summaryMessages = buildSummaryEvaluationPrompt(tabInfo.cachedSummary!, userMessage);
 
       try {
         const summaryResponse = await silentChat(summaryMessages, port);
@@ -499,8 +556,9 @@ async function processMultiTabQuery(
         } else {
           // 摘要不够，使用原始内容
 
-          compressedContent = await answerFromContent(tabInfo.content, userMessage, tabInfo.index, port);
-          console.log(`[Background] Insufficient for: ${tabInfo.title}, answerFromContent: ${compressedContent}`);
+          const fallbackMessages = buildExtractFromContentPrompt(tabInfo.content, userMessage, tabInfo.index);
+          compressedContent = await silentChat(fallbackMessages, port);
+          console.log(`[Background] Insufficient for: ${tabInfo.title}, extracted: ${compressedContent}`);
           isRelevant = !isIrrelevantAnswer(compressedContent);
         }
       } catch (err) {
@@ -512,8 +570,9 @@ async function processMultiTabQuery(
     } else {
       // 无缓存摘要，直接使用原始内容
       try {
-        compressedContent = await answerFromContent(tabInfo.content, userMessage, tabInfo.index, port);
-        console.log(`[Background] answerFromContent: ${compressedContent}`);
+        const extractMessages = buildExtractFromContentPrompt(tabInfo.content, userMessage, tabInfo.index);
+        compressedContent = await silentChat(extractMessages, port);
+        console.log(`[Background] extracted: ${compressedContent}`);
         // isRelevant = !isIrrelevantAnswer(compressedContent);
       } catch (err) {
         if (err instanceof Error && err.message.includes("Port disconnected")) throw err;
@@ -536,25 +595,9 @@ async function processMultiTabQuery(
   const relevantTabs = compressedTabContents.filter(tab => tab.isRelevant);
   console.log(`[Background] Found ${relevantTabs.length} relevant tabs`);
 
-  const combinedContext = relevantTabs
-    .map((tabInfo) =>
-      `=== Tab ${tabInfo.index}: ${tabInfo.title} ===\nURL: ${tabInfo.url}\nContent: ${tabInfo.compressed}\n`
-    )
-    .join("\n");
-
   return {
     success: true,
-    finalMessages: [
-      {
-        role: "system",
-        content: relevantTabs.length > 0
-          ? `You are a helpful assistant. Below is the content from ${relevantTabs.length} tabs:\n\n${combinedContext}\n\n`
-          + `Instructions:\n- answer the question strictly based on the content from tabs. Do not add assumptions.\n`
-          + `- Be concise and NEVER repeat the same sentence, phrase, or point.`
-          : `You are a helpful assistant. The user has ${allTabContents.length} browser tabs open, but none contain relevant information. Please let the user know briefly.`
-      },
-      { role: "user", content: `QUESTION: ${userMessage}` }
-    ]
+    finalMessages: buildMultiTabFinalPrompt(relevantTabs, allTabContents.length, userMessage)
   };
 }
 
@@ -567,16 +610,7 @@ async function summarizePage(
 ): Promise<{ summary: string }> {
   console.log("[Background] Summarizing page:", title);
 
-  const messages = [
-    {
-      role: "system",
-      content: "You are a helpful assistant that summarizes web pages. Create a concise summary with key points (5-10 bullet points). Focus on: main topics, key facts, important details, and actionable information. Be brief but comprehensive."
-    },
-    {
-      role: "user",
-      content: `Summarize this webpage:\n\nTitle: ${title}\n\nContent:\n${content}`
-    }
-  ];
+  const messages = buildSummarizePagePrompt(title, content);
 
   const summary = await silentChat(messages);
   console.log("[Background] Summary generated:", summary.length, "chars");
