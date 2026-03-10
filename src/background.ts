@@ -52,6 +52,7 @@ const PENDING_CACHE_PREFIX = "pending_page_";
 const DEFAULT_MODEL_ID = "Phi-3.5-mini-instruct-q4f16_1-MLC"//"Qwen3-1.7B-q4f16_1-MLC" //"Llama-3.2-1B-Instruct-q4f16_1-MLC"// "Llama-3.2-3B-Instruct-q4f32_1-MLC";
 const MODEL_STORAGE_KEY = "selected_model_id";
 const USE_SUMMARY_CACHE = false; // 是否启用摘要缓存
+const WORKFLOW_TYPE: number = 5; // 1: 直接拼接，2: content提取，3: summary提取，4: summary评估+回退，5: 子问题+content，6: 子问题+summary评估+回退
 let currentModelId = DEFAULT_MODEL_ID;
 
 // Load model ID from storage
@@ -501,6 +502,69 @@ function buildSummarizePagePrompt(
   ];
 }
 
+// Prompt: 根据用户问题为每个标签页生成子问题
+function buildSubQuestionGenerationPrompt(
+  tabs: Array<{ index: number; title: string }>,
+  userMessage: string
+): Array<{ role: string; content: string }> {
+  const tabList = tabs.map(t => `tab ${t.index} title: ${t.title}`).join("\n");
+  return [
+    {
+      role: "system",
+      content: [
+        "You are a helpful assistant that decomposes a user question into per-tab sub-questions.",
+        "Given the list of open browser tabs and the user's question, generate a focused sub-question for EACH tab that will help gather the information needed to answer the overall question.",
+        "",
+        "Rules:",
+        "- Output EXACTLY one line per tab.",
+        "- Each line MUST follow the format:  tab <index> question: <sub-question>",
+        "- The sub-question should ask for the specific information that this tab is likely to contain, based on its title.",
+        "- Do NOT add any other text, explanation, or formatting."
+      ].join("\n")
+    },
+    {
+      role: "user",
+      content: `Tabs:\n${tabList}\n\nUser question: ${userMessage}`
+    }
+  ];
+}
+
+// 解析子问题生成结果，返回 { tabIndex -> subQuestion } 映射
+// 兼容两种格式：
+//   1. 标准格式（每行一个）: tab 1 question: xxx\ntab 2 question: xxx
+//   2. 模型省略 "question:" 且无换行: tab 1  xxx?tab 2  xxx?
+function parseSubQuestions(response: string): Map<number, string> {
+  const map = new Map<number, string>();
+
+  // 先尝试标准格式（按行解析，含 "question:" 关键词）
+  const lines = response.split("\n").map(l => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    const match = line.match(/tab\s+(\d+)\s+question:\s*(.+)/i);
+    if (match) {
+      const idx = parseInt(match[1], 10);
+      map.set(idx, match[2].trim());
+    }
+  }
+
+  // 如果标准格式没有解析到任何结果，回退到宽松模式：
+  // 用正则全局匹配 "tab <n>" 边界来拆分，不要求 "question:" 关键词
+  if (map.size === 0) {
+    const relaxedRegex = /tab\s+(\d+)\s+(?:question:\s*)?([\s\S]*?)(?=tab\s+\d+\s|$)/gi;
+    let m: RegExpExecArray | null;
+    while ((m = relaxedRegex.exec(response)) !== null) {
+      const idx = parseInt(m[1], 10);
+      const q = m[2].trim();
+      if (q) {
+        map.set(idx, q);
+      }
+    }
+  }
+
+  // 对于未解析到的标签页，回退使用原始 userMessage（不应发生，但作为安全保障）
+  // 调用方自行处理 fallback
+  return map;
+}
+
 // 处理多标签页查询 - 核心逻辑
 async function processMultiTabQuery(
   allTabContents: TabContentInfo[],
@@ -522,9 +586,38 @@ async function processMultiTabQuery(
     };
   }
 
-  console.log(`[Background] Processing ${allTabContents.length} tabs...`);
+  console.log(`[Background] Processing ${allTabContents.length} tabs with WORKFLOW_TYPE=${WORKFLOW_TYPE}...`);
 
-  // Phase 1: 对每个标签页，使用摘要或原始内容回答问题
+  // ---------- WORKFLOW 1: 直接把原始内容当作 compressed，跳过中间推理 ----------
+  if (WORKFLOW_TYPE === 1) {
+    const tabsWithContent = allTabContents.map(tabInfo => ({
+      index: tabInfo.index,
+      title: tabInfo.title,
+      url: tabInfo.url,
+      compressed: tabInfo.content.substring(0, CONFIG.maxContentLength),
+    }));
+    return {
+      success: true,
+      finalMessages: buildMultiTabFinalPrompt(tabsWithContent, allTabContents.length, userMessage)
+    };
+  }
+
+  // ---------- 对于 WORKFLOW 5 / 6: 先生成子问题 ----------
+  let subQuestions: Map<number, string> | null = null;
+  if (WORKFLOW_TYPE === 5 || WORKFLOW_TYPE === 6) {
+    const tabMeta = allTabContents.map(t => ({ index: t.index, title: t.title }));
+    const subQPrompt = buildSubQuestionGenerationPrompt(tabMeta, userMessage);
+    try {
+      const subQResponse = await silentChat(subQPrompt, port);
+      console.log("[Background] Sub-question response:", subQResponse);
+      subQuestions = parseSubQuestions(subQResponse);
+    } catch (err) {
+      if (err instanceof Error && err.message.includes("Port disconnected")) throw err;
+      console.error("[Background] Failed to generate sub-questions, falling back to userMessage:", err);
+    }
+  }
+
+  // ---------- Phase 1: 逐标签页压缩 ----------
   const compressedTabContents: {
     index: number;
     title: string;
@@ -537,49 +630,103 @@ async function processMultiTabQuery(
     const tabInfo = allTabContents[i];
     console.log(`[Background] Processing tab ${tabInfo.index}/${allTabContents.length}: ${tabInfo.title}`);
 
+    // 确定本标签页使用的问题文本
+    const tabQuestion = subQuestions?.get(tabInfo.index) || userMessage;
+    if (subQuestions) {
+      console.log(`[Background] Tab ${tabInfo.index} sub-question: ${tabQuestion}`);
+    }
+
     let compressedContent = "";
     let isRelevant = true;
 
-    if (USE_SUMMARY_CACHE && tabInfo.hasCachedSummary && tabInfo.cachedSummary) {
-      // 使用缓存的摘要
-      console.log(`[Background] Using cached summary for: ${tabInfo.title}`);
-
-      const summaryMessages = buildSummaryEvaluationPrompt(tabInfo.cachedSummary!, userMessage);
-
-      try {
-        const summaryResponse = await silentChat(summaryMessages, port);
-        const parsedResult = parseSummaryResponse(summaryResponse);
-
-        if (parsedResult.sufficient) {
-          compressedContent = parsedResult.answer;
-          isRelevant = !isIrrelevantAnswer(compressedContent);
-        } else {
-          // 摘要不够，使用原始内容
-
-          const fallbackMessages = buildExtractFromContentPrompt(tabInfo.content, userMessage, tabInfo.index);
-          compressedContent = await silentChat(fallbackMessages, port);
-          console.log(`[Background] Insufficient for: ${tabInfo.title}, extracted: ${compressedContent}`);
-          isRelevant = !isIrrelevantAnswer(compressedContent);
+    try {
+      switch (WORKFLOW_TYPE) {
+        // --- WORKFLOW 2: 用 userMessage + content 提取 ---
+        case 2: {
+          const msgs = buildExtractFromContentPrompt(tabInfo.content, userMessage, tabInfo.index);
+          compressedContent = await silentChat(msgs, port);
+          console.log(`[Background] [WF2] extracted: ${compressedContent}`);
+          break;
         }
-      } catch (err) {
-        if (err instanceof Error && err.message.includes("Port disconnected")) throw err;
-        console.error(`[Background] Error processing tab ${tabInfo.title}:`, err);
-        compressedContent = "Error processing this tab";
-        isRelevant = false;
+
+        // --- WORKFLOW 3: 用 userMessage + cachedSummary 提取 ---
+        case 3: {
+          const source = tabInfo.cachedSummary || tabInfo.content;
+          const msgs = buildExtractFromContentPrompt(source, userMessage, tabInfo.index);
+          compressedContent = await silentChat(msgs, port);
+          console.log(`[Background] [WF3] extracted (from ${tabInfo.cachedSummary ? "summary" : "content"}): ${compressedContent}`);
+          break;
+        }
+
+        // --- WORKFLOW 4: 先评估 cachedSummary，不足则回退 content ---
+        case 4: {
+          if (tabInfo.cachedSummary) {
+            const evalMsgs = buildSummaryEvaluationPrompt(tabInfo.cachedSummary, userMessage);
+            const evalResp = await silentChat(evalMsgs, port);
+            const parsed = parseSummaryResponse(evalResp);
+
+            if (parsed.sufficient) {
+              compressedContent = parsed.answer;
+              isRelevant = !isIrrelevantAnswer(compressedContent);
+            } else {
+              // 摘要不足，回退到 content
+              const fallback = buildExtractFromContentPrompt(tabInfo.content, userMessage, tabInfo.index);
+              compressedContent = await silentChat(fallback, port);
+              console.log(`[Background] [WF4] Insufficient summary for: ${tabInfo.title}, extracted: ${compressedContent}`);
+              isRelevant = !isIrrelevantAnswer(compressedContent);
+            }
+          } else {
+            // 无摘要，直接用 content
+            const msgs = buildExtractFromContentPrompt(tabInfo.content, userMessage, tabInfo.index);
+            compressedContent = await silentChat(msgs, port);
+            console.log(`[Background] [WF4] No summary, extracted: ${compressedContent}`);
+          }
+          break;
+        }
+
+        // --- WORKFLOW 5: 子问题 + content 提取 ---
+        case 5: {
+          const msgs = buildExtractFromContentPrompt(tabInfo.content, tabQuestion, tabInfo.index);
+          compressedContent = await silentChat(msgs, port);
+          console.log(`[Background] [WF5] extracted: ${compressedContent}`);
+          break;
+        }
+
+        // --- WORKFLOW 6: 子问题 + 先评估 cachedSummary，不足则回退 content ---
+        case 6: {
+          if (tabInfo.cachedSummary) {
+            const evalMsgs = buildSummaryEvaluationPrompt(tabInfo.cachedSummary, tabQuestion);
+            const evalResp = await silentChat(evalMsgs, port);
+            const parsed = parseSummaryResponse(evalResp);
+
+            if (parsed.sufficient) {
+              compressedContent = parsed.answer;
+              isRelevant = !isIrrelevantAnswer(compressedContent);
+            } else {
+              const fallback = buildExtractFromContentPrompt(tabInfo.content, tabQuestion, tabInfo.index);
+              compressedContent = await silentChat(fallback, port);
+              console.log(`[Background] [WF6] Insufficient summary for: ${tabInfo.title}, extracted: ${compressedContent}`);
+              isRelevant = !isIrrelevantAnswer(compressedContent);
+            }
+          } else {
+            const msgs = buildExtractFromContentPrompt(tabInfo.content, tabQuestion, tabInfo.index);
+            compressedContent = await silentChat(msgs, port);
+            console.log(`[Background] [WF6] No summary, extracted: ${compressedContent}`);
+          }
+          break;
+        }
+
+        default:
+          console.warn(`[Background] Unknown WORKFLOW_TYPE: ${WORKFLOW_TYPE}, falling back to WF2`);
+          const msgs = buildExtractFromContentPrompt(tabInfo.content, userMessage, tabInfo.index);
+          compressedContent = await silentChat(msgs, port);
+          break;
       }
-    } else {
-      // 无缓存摘要，直接使用原始内容
-      try {
-        const extractMessages = buildExtractFromContentPrompt(tabInfo.content, userMessage, tabInfo.index);
-        compressedContent = await silentChat(extractMessages, port);
-        console.log(`[Background] extracted: ${compressedContent}`);
-        // isRelevant = !isIrrelevantAnswer(compressedContent);
-      } catch (err) {
-        if (err instanceof Error && err.message.includes("Port disconnected")) throw err;
-        console.error(`[Background] Error processing tab ${tabInfo.title}:`, err);
-        compressedContent = "Error processing this tab";
-        isRelevant = false;
-      }
+    } catch (err) {
+      if (err instanceof Error && err.message.includes("Port disconnected")) throw err;
+      console.error(`[Background] Error processing tab ${tabInfo.title}:`, err);
+      compressedContent = "Error processing this tab";
+      isRelevant = false;
     }
 
     compressedTabContents.push({
@@ -591,7 +738,7 @@ async function processMultiTabQuery(
     });
   }
 
-  // Phase 2: 过滤相关标签页并组合
+  // ---------- Phase 2: 过滤相关标签页并组合 ----------
   const relevantTabs = compressedTabContents.filter(tab => tab.isRelevant);
   console.log(`[Background] Found ${relevantTabs.length} relevant tabs`);
 
