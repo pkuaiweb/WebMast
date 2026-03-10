@@ -284,10 +284,9 @@ interface MultiTabQueryResult {
   error?: string;
 }
 
-// 解析摘要响应 - 三种情况：
+// 解析摘要响应 - 两种情况：
 // 1. sufficient:yes + answer -> 摘要足够，直接使用答案
-// 2. sufficient:no          -> 摘要相关但信息不足，回退到原始内容
-// 3. sufficient:yes + N/A   -> 摘要与问题无关，标记为不相关（跳过原始内容）
+// 2. sufficient:no          -> 摘要信息不足，回退到原始内容
 function parseSummaryResponse(response: string): { sufficient: boolean; answer: string } {
   console.log("[Background] Parsing summary response:", response);
   const normalized = response.toLowerCase();
@@ -368,16 +367,7 @@ async function silentChat(
   });
 }
 
-// 判断模型响应是否为"无关"（兜底否定性描述）
-function isIrrelevantAnswer(text: string): boolean {
-  const t = text.trim().toLowerCase();
-  if (t.includes("n/a") || t === "") return true;
-  // 兜底：模型未遵循格式，输出了否定性描述而非 N/A
-  const negativePatterns = /^[•\-\*]?\s*(no\s+(specific\s+)?(information|data|details|color|price|mention|content)|not\s+(found|mentioned|available|applicable)|n\/a|none|nothing\s+(found|relevant))/i;
-  return negativePatterns.test(t);
-}
-
-// ==================== Prompt 构建函数 ====================
+// ==================== Prompt 构建函数 ==
 
 // Prompt: 从单个标签页内容中提取与问题相关的信息
 function buildExtractFromContentPrompt(
@@ -439,18 +429,14 @@ function buildSummaryEvaluationPrompt(
         "2. A constraint is met ONLY when the summary provides an explicit value that satisfies it. Never assume a constraint is met if the relevant data is missing or ambiguous.",
         "3. In your ANSWER, always state the key facts you extracted so downstream reasoning can double-check them.",
         "",
-        "You MUST follow one of these three response formats exactly (no markdown, no asterisks, no extra text):",
+        "You MUST follow one of these two response formats exactly (no markdown, no asterisks, no extra text):",
         "",
         "Case 1 – Summary is sufficient to answer the question:",
         "SUFFICIENT: yes",
         "ANSWER: <concise answer with the key facts extracted from the summary>",
         "",
-        "Case 2 – Summary is relevant to the question but lacks enough detail to verify all constraints:",
-        "SUFFICIENT: no",
-        "",
-        "Case 3 – Summary is completely unrelated to the question:",
-        "SUFFICIENT: yes",
-        "ANSWER: N/A"
+        "Case 2 – Summary lacks enough detail to verify all constraints:",
+        "SUFFICIENT: no"
       ].join("\n")
     },
     {
@@ -462,24 +448,25 @@ function buildSummaryEvaluationPrompt(
 
 // Prompt: 多标签页合并结果后的最终问答
 function buildMultiTabFinalPrompt(
-  relevantTabs: Array<{ index: number; title: string; url: string; compressed: string }>,
+  tabs: Array<{ index: number; title: string; url: string; compressed: string }>,
   totalTabCount: number,
   userMessage: string
 ): Array<{ role: string; content: string }> {
-  const combinedContext = relevantTabs
+  const combinedContext = tabs
     .map((tabInfo) =>
-      `=== Tab ${tabInfo.index}: ${tabInfo.title} ===\nURL: ${tabInfo.url}\nContent: ${tabInfo.compressed}\n`
+      `### Tab ${tabInfo.index}: ${tabInfo.title}\n${tabInfo.compressed}\n`
     )
     .join("\n");
 
   return [
     {
       role: "system",
-      content: relevantTabs.length > 0
-        ? `You are a helpful assistant. Below is the content from ${relevantTabs.length} tabs:\n\n${combinedContext}\n\n`
-        + `Instructions:\n- answer the question strictly based on the content from tabs. Do not add assumptions.\n`
+      content: `You are a helpful assistant. Below is the extracted information from ${tabs.length} tabs:\n\n${combinedContext}\n\n`
+        + `Instructions:\n`
+        + `- Answer the question strictly based on the information from the tabs above.\n`
+        + `- When the question references information across multiple tabs, you MUST cross-reference: look up the value from one tab and match/compare it against the data from the other tab.\n`
+        + `- Focus on what the user is actually asking — they may want to combine or compare specific attributes across tabs.\n`
         + `- Be concise and NEVER repeat the same sentence, phrase, or point.`
-        : `You are a helpful assistant. The user has ${totalTabCount} browser tabs open, but none contain relevant information. Please let the user know briefly.`
     },
     { role: "user", content: `QUESTION: ${userMessage}` }
   ];
@@ -507,7 +494,7 @@ function buildSubQuestionGenerationPrompt(
   tabs: Array<{ index: number; title: string }>,
   userMessage: string
 ): Array<{ role: string; content: string }> {
-  const tabList = tabs.map(t => `tab ${t.index} title: ${t.title}`).join("\n");
+  const tabList = tabs.map(t => `- Tab ${t.index}: ${t.title}`).join("\n");
   return [
     {
       role: "system",
@@ -536,10 +523,11 @@ function buildSubQuestionGenerationPrompt(
 function parseSubQuestions(response: string): Map<number, string> {
   const map = new Map<number, string>();
 
-  // 先尝试标准格式（按行解析，含 "question:" 关键词）
+  // 先尝试标准格式（按行解析，含 "question:"/"Question:" 关键词）
+  // 兼容: "tab 1 question:", "Tab1 Question:", "Tab #1 question:", "TAB 1 QUESTION:" 等
   const lines = response.split("\n").map(l => l.trim()).filter(Boolean);
   for (const line of lines) {
-    const match = line.match(/tab\s+(\d+)\s+question:\s*(.+)/i);
+    const match = line.match(/tab\s*#?\s*(\d+)\s*[:\-]?\s*question\s*:\s*(.+)/i);
     if (match) {
       const idx = parseInt(match[1], 10);
       map.set(idx, match[2].trim());
@@ -548,8 +536,9 @@ function parseSubQuestions(response: string): Map<number, string> {
 
   // 如果标准格式没有解析到任何结果，回退到宽松模式：
   // 用正则全局匹配 "tab <n>" 边界来拆分，不要求 "question:" 关键词
+  // 兼容: "Tab1 xxx", "tab 1  xxx", "Tab #2 xxx" 等（均大小写不敏感）
   if (map.size === 0) {
-    const relaxedRegex = /tab\s+(\d+)\s+(?:question:\s*)?([\s\S]*?)(?=tab\s+\d+\s|$)/gi;
+    const relaxedRegex = /tab\s*#?\s*(\d+)\s*[:\-]?\s*(?:question\s*:\s*)?([\s\S]*?)(?=tab\s*#?\s*\d+\s*[:\-]?\s|$)/gi;
     let m: RegExpExecArray | null;
     while ((m = relaxedRegex.exec(response)) !== null) {
       const idx = parseInt(m[1], 10);
@@ -576,7 +565,7 @@ async function processMultiTabQuery(
     // 单个标签页或无标签页，使用简单逻辑
     const pageContext = allTabContents
       .map((tabInfo) =>
-        `=== Tab ${tabInfo.index}: ${tabInfo.title} ===\nURL: ${tabInfo.url}\n\n${tabInfo.content}\n\n`
+        `### Tab ${tabInfo.index}: ${tabInfo.title}\n\n${tabInfo.content}\n\n`
       )
       .join("\n");
 
@@ -623,7 +612,6 @@ async function processMultiTabQuery(
     title: string;
     url: string;
     compressed: string;
-    isRelevant: boolean
   }[] = [];
 
   for (let i = 0; i < allTabContents.length; i++) {
@@ -637,7 +625,6 @@ async function processMultiTabQuery(
     }
 
     let compressedContent = "";
-    let isRelevant = true;
 
     try {
       switch (WORKFLOW_TYPE) {
@@ -667,13 +654,11 @@ async function processMultiTabQuery(
 
             if (parsed.sufficient) {
               compressedContent = parsed.answer;
-              isRelevant = !isIrrelevantAnswer(compressedContent);
             } else {
               // 摘要不足，回退到 content
               const fallback = buildExtractFromContentPrompt(tabInfo.content, userMessage, tabInfo.index);
               compressedContent = await silentChat(fallback, port);
               console.log(`[Background] [WF4] Insufficient summary for: ${tabInfo.title}, extracted: ${compressedContent}`);
-              isRelevant = !isIrrelevantAnswer(compressedContent);
             }
           } else {
             // 无摘要，直接用 content
@@ -701,12 +686,10 @@ async function processMultiTabQuery(
 
             if (parsed.sufficient) {
               compressedContent = parsed.answer;
-              isRelevant = !isIrrelevantAnswer(compressedContent);
             } else {
               const fallback = buildExtractFromContentPrompt(tabInfo.content, tabQuestion, tabInfo.index);
               compressedContent = await silentChat(fallback, port);
               console.log(`[Background] [WF6] Insufficient summary for: ${tabInfo.title}, extracted: ${compressedContent}`);
-              isRelevant = !isIrrelevantAnswer(compressedContent);
             }
           } else {
             const msgs = buildExtractFromContentPrompt(tabInfo.content, tabQuestion, tabInfo.index);
@@ -726,7 +709,6 @@ async function processMultiTabQuery(
       if (err instanceof Error && err.message.includes("Port disconnected")) throw err;
       console.error(`[Background] Error processing tab ${tabInfo.title}:`, err);
       compressedContent = "Error processing this tab";
-      isRelevant = false;
     }
 
     compressedTabContents.push({
@@ -734,17 +716,15 @@ async function processMultiTabQuery(
       title: tabInfo.title,
       url: tabInfo.url,
       compressed: compressedContent,
-      isRelevant: isRelevant
     });
   }
 
-  // ---------- Phase 2: 过滤相关标签页并组合 ----------
-  const relevantTabs = compressedTabContents.filter(tab => tab.isRelevant);
-  console.log(`[Background] Found ${relevantTabs.length} relevant tabs`);
+  // ---------- Phase 2: 组合所有标签页 ----------
+  console.log(`[Background] Using all ${compressedTabContents.length} tabs`);
 
   return {
     success: true,
-    finalMessages: buildMultiTabFinalPrompt(relevantTabs, allTabContents.length, userMessage)
+    finalMessages: buildMultiTabFinalPrompt(compressedTabContents, allTabContents.length, userMessage)
   };
 }
 
