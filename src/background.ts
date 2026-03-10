@@ -246,7 +246,7 @@ async function fetchAllTabContents(): Promise<TabContentInfo[]> {
         const cachedSummary = await getCachedSummary(tabUrl);
 
         results.push({
-          index: tab.index ?? 0,
+          index: (tab.index ?? -1) + 1,
           title: tab.title || "Untitled",
           url: tabUrl,
           content: response.contents,
@@ -331,7 +331,7 @@ function appendNothinkIfQwen3(messages: Array<{ role: string; content: string }>
 // activeRequests: 可选，传入端口关联的请求集合，用于 disconnect 时取消
 async function silentChat(
   messages: Array<{ role: string; content: string }>,
-  // activeRequests?: Set<string>
+  port: chrome.runtime.Port | null = null,
 ): Promise<string> {
   messages = appendNothinkIfQwen3(messages);
   return new Promise((resolve, reject) => {
@@ -341,12 +341,18 @@ async function silentChat(
     // activeRequests?.add(requestId);
     // 注册 reject 回调用于取消
     pendingRejects.set(requestId, reject);
+    if (port) {
+      streamPorts.set(requestId, port);
+    }
 
     chrome.runtime.sendMessage({
       type: "CHAT_COMPLETION",
       data: { requestId, messages }
     }, (response) => {
       pendingRejects.delete(requestId);
+      if (port) {
+        streamPorts.delete(requestId);
+      }
       if (chrome.runtime.lastError) {
         reject(new Error(chrome.runtime.lastError.message));
       } else if (response?.success) {
@@ -374,7 +380,8 @@ function isIrrelevantAnswer(text: string): boolean {
 async function answerFromContent(
   content: string,
   question: string,
-  index: number
+  index: number,
+  port: chrome.runtime.Port
 ): Promise<string> {
   const messages = [
     {
@@ -399,14 +406,14 @@ async function answerFromContent(
     }
   ];
 
-  return silentChat(messages);
+  return silentChat(messages, port);
 }
 
 // 处理多标签页查询 - 核心逻辑
 async function processMultiTabQuery(
   allTabContents: TabContentInfo[],
   userMessage: string,
-  // activeRequests?: Set<string>
+  port: chrome.runtime.Port,
 ): Promise<MultiTabQueryResult> {
 
   if (allTabContents.length <= 1) {
@@ -483,7 +490,7 @@ async function processMultiTabQuery(
       ];
 
       try {
-        const summaryResponse = await silentChat(summaryMessages);
+        const summaryResponse = await silentChat(summaryMessages, port);
         const parsedResult = parseSummaryResponse(summaryResponse);
 
         if (parsedResult.sufficient) {
@@ -492,7 +499,7 @@ async function processMultiTabQuery(
         } else {
           // 摘要不够，使用原始内容
 
-          compressedContent = await answerFromContent(tabInfo.content, userMessage, tabInfo.index);
+          compressedContent = await answerFromContent(tabInfo.content, userMessage, tabInfo.index, port);
           console.log(`[Background] Insufficient for: ${tabInfo.title}, answerFromContent: ${compressedContent}`);
           isRelevant = !isIrrelevantAnswer(compressedContent);
         }
@@ -505,7 +512,7 @@ async function processMultiTabQuery(
     } else {
       // 无缓存摘要，直接使用原始内容
       try {
-        compressedContent = await answerFromContent(tabInfo.content, userMessage, tabInfo.index);
+        compressedContent = await answerFromContent(tabInfo.content, userMessage, tabInfo.index, port);
         console.log(`[Background] answerFromContent: ${compressedContent}`);
         // isRelevant = !isIrrelevantAnswer(compressedContent);
       } catch (err) {
@@ -862,7 +869,7 @@ chrome.runtime.onConnect.addListener((port) => {
             console.log(`[Background] Fetched ${tabContents.length} tabs`);
           }
 
-          const queryResult = await processMultiTabQuery(tabContents, userMessage);
+          const queryResult = await processMultiTabQuery(tabContents, userMessage, port);
 
           if (!queryResult.success || !queryResult.finalMessages) {
             port.postMessage({ type: "error", error: queryResult.error || "Failed to process query" });
@@ -872,6 +879,7 @@ chrome.runtime.onConnect.addListener((port) => {
           // 直接将处理结果发送 streaming，中间结果不经由 sidebar
           await startStreaming(port, queryResult.finalMessages);
         } catch (err) {
+          console.error("[Background] Error in PROCESS_AND_STREAM:", err);
           port.postMessage({ type: "error", error: String(err) });
         }
       }
@@ -883,9 +891,24 @@ chrome.runtime.onConnect.addListener((port) => {
       for (const [requestId, p] of streamPorts.entries()) {
         if (p === port) {
           streamPorts.delete(requestId);
+
+          // 通知 offscreen 中止生成任务
+          chrome.runtime.sendMessage({
+            type: "ABORT_REQUEST",
+            data: { requestId }
+          }, () => {
+            // 忽略 lastError（offscreen 可能已关闭）
+            if (chrome.runtime.lastError) {
+              console.warn(`[Background] Failed to send ABORT_REQUEST for ${requestId}:`, chrome.runtime.lastError.message);
+            } else {
+              console.log(`[Background] Sent ABORT_REQUEST for ${requestId}`);
+            }
+          });
+
           // 拒绝 silentChat 的 pending promise
           const rejectFn = pendingRejects.get(requestId);
           if (rejectFn) {
+            console.log(`[Background] Rejecting pending request ${requestId} due to port disconnect`);
             rejectFn(new Error("Port disconnected, request aborted"));
             pendingRejects.delete(requestId);
           }

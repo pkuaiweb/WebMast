@@ -22,7 +22,7 @@ let engineReady = false;
 let currentModelId = "";
 
 // 请求管理（用于取消）
-// const activeRequests = new Map<string, { aborted: boolean }>();
+const activeRequests = new Map<string, { aborted: boolean }>();
 
 // ==================== 抗复读配置 ====================
 
@@ -204,7 +204,7 @@ async function generateCore(
     throw new Error("Engine not ready");
   }
 
-  // activeRequests.set(requestId, { aborted: false });
+  activeRequests.set(requestId, { aborted: false });
 
   let content = "";
   let usage: any = null;
@@ -217,22 +217,33 @@ async function generateCore(
 
   // const detector = new RepetitionDetector();
 
-  for await (const chunk of completion) {
+  let interrupted = false;
 
+  for await (const chunk of completion) {
     const delta = chunk.choices[0]?.delta?.content;
     if (delta) {
       content += delta;
       // detector.feed(delta);
       callbacks.onChunk(delta);
     }
-
+    // 超过长度阈值时，通知引擎中断，但不要 break —— 让 stream 自然结束
+    // break 会触发 async iterator 的 return()，与引擎内部中断清理竞争，
+    // 导致内部生成锁未释放，后续 create() 永远 pending。
+    if (!interrupted && activeRequests.get(requestId)?.aborted) {
+      engine.interruptGenerate();
+      interrupted = true;
+    }
     if (chunk.usage) {
       usage = chunk.usage;
     }
   }
-  // activeRequests.delete(requestId);
+  engine.resetChat(); // 清理 KV cache，避免跨请求干扰  
+  activeRequests.delete(requestId);
+  if (interrupted) {
+    callbacks.onAbort();
+    throw new Error("Request aborted");
+  }
   callbacks.onDone(usage);
-
   return { content, usage };
 }
 
@@ -301,6 +312,13 @@ async function chatCompletionStream(
 
 // ==================== 请求取消 ====================
 
+function abortRequest(requestId: string) {
+  const request = activeRequests.get(requestId);
+  if (request) {
+    request.aborted = true;
+    console.log("[Offscreen] Request aborted:", requestId);
+  }
+}
 
 // ==================== 重置引擎 ====================
 
@@ -339,7 +357,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return true;
 
     case "ABORT_REQUEST":
-      // abortRequest(message.data.requestId);
+      abortRequest(message.data.requestId);
       sendResponse({ status: "aborted" });
       return true;
 
