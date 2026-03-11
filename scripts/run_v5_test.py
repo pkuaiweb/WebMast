@@ -36,16 +36,34 @@ PROJECT_DIR = SCRIPT_DIR.parent  # WebMast/
 
 EXTENSION_PATH = str(PROJECT_DIR / "dist")
 V5_JSON_PATH = str(PROJECT_DIR.parent / "正文" / "data" / "v5.json")
-OUTPUT_PATH = str(PROJECT_DIR.parent / "正文" / "data" / "v5_results.json")
+OUTPUT_DIR = str(PROJECT_DIR.parent / "正文" / "data")
 USER_DATA_DIR = str(PROJECT_DIR / "test-profile")
 
 REPEAT_COUNT = 3                  # 每个任务重复次数
 PAGE_LOAD_TIMEOUT = 60000         # 页面加载超时 (ms)
-ENGINE_READY_TIMEOUT = 600000     # 引擎加载超时 (ms), 首次下载模型较慢
-ANSWER_TIMEOUT = 600              # 等待回答超时 (秒)
+ENGINE_READY_TIMEOUT = 900000     # 引擎加载超时 (ms), 首次下载模型较慢
+ANSWER_TIMEOUT = 90              # 等待回答超时 (秒)
 ANSWER_STABLE_SECONDS = 5         # 回答内容稳定多少秒视为完成
-WAIT_AFTER_PAGE_LOAD = 3          # 页面加载后等待 content script 注入的秒数
-NEED_LOGIN = True                 # 是否需要登录（首次运行时暂停让用户手动登录）
+WAIT_AFTER_PAGE_LOAD = 10          # 页面加载后等待 content script 注入的秒数
+NEED_LOGIN = False                 # 是否需要登录（首次运行时暂停让用户手动登录）
+BACKGROUND_TS_PATH = str(PROJECT_DIR / "src" / "background.ts")
+
+
+def parse_background_constants() -> dict:
+    """从 background.ts 中解析 DEFAULT_MODEL_ID 和 WORKFLOW_TYPE"""
+    result = {"model_id": "unknown", "workflow_type": "unknown"}
+    try:
+        with open(BACKGROUND_TS_PATH, "r", encoding="utf-8") as f:
+            content = f.read()
+        m = re.search(r'const\s+DEFAULT_MODEL_ID\s*=\s*"([^"]+)"', content)
+        if m:
+            result["model_id"] = m.group(1)
+        m = re.search(r'const\s+WORKFLOW_TYPE\s*:\s*number\s*=\s*(\d+)', content)
+        if m:
+            result["workflow_type"] = int(m.group(1))
+    except Exception as e:
+        print(f"  警告: 无法解析 background.ts 常量: {e}")
+    return result
 
 
 async def get_extension_id(context) -> str:
@@ -254,6 +272,14 @@ async def main():
         tasks = json.load(f)
     print(f"已加载 {len(tasks)} 个任务")
 
+    # 解析 background.ts 中的常量
+    bg_constants = parse_background_constants()
+    model_short = bg_constants["model_id"]  # e.g. "Qwen3"
+    wf_type = bg_constants["workflow_type"]
+    OUTPUT_PATH = os.path.join(OUTPUT_DIR, f"v5_results_{model_short}_wf{wf_type}.json")
+    print(f"Model ID: {bg_constants['model_id']}, Workflow Type: {wf_type}")
+    print(f"输出文件: {OUTPUT_PATH}")
+
     # 获取 sidebar 文件名
     sidebar_filename = get_sidebar_filename(EXTENSION_PATH)
     print(f"Sidebar 文件: {sidebar_filename}")
@@ -285,8 +311,9 @@ async def main():
         context = await p.chromium.launch_persistent_context(
             user_data_dir=USER_DATA_DIR,
             channel="msedge",
-            headless=False,
+            headless=False,          # 保持 False，通过 --headless=new 启用新 headless 模式（支持扩展）
             args=[
+                "--headless=new",
                 f"--disable-extensions-except={EXTENSION_PATH}",
                 f"--load-extension={EXTENSION_PATH}",
             ],
@@ -335,9 +362,6 @@ async def main():
 
                 task_result = {
                     "task_id": task_id,
-                    "intent": intent,
-                    "open_url": open_urls,
-                    "eval": task.get("eval", {}),
                     "runs": [],
                 }
 
@@ -352,6 +376,18 @@ async def main():
                 # ---- 重复提交 3 次 ----
                 for run_idx in range(REPEAT_COUNT):
                     print(f"\n  --- Run {run_idx+1}/{REPEAT_COUNT} ---")
+
+                    # 每次 run 都关闭并重新打开 sidebar，确保状态干净
+                    try:
+                        await sidebar_page.close()
+                        await asyncio.sleep(1)
+                    except Exception:
+                        pass
+                    print(f"    重新打开 sidebar...")
+                    sidebar_page = await context.new_page()
+                    await sidebar_page.goto(sidebar_url, timeout=30000)
+                    await wait_for_engine_ready(sidebar_page)
+                    await asyncio.sleep(1)
 
                     # 聚焦到 sidebar 页面
                     await sidebar_page.bring_to_front()
@@ -378,9 +414,9 @@ async def main():
                     print(f"    TTFT: {ttft}s")
                     print(f"    Answer: {answer_preview}")
 
-                    # 两次提交之间等待一小段时间
-                    if run_idx < REPEAT_COUNT - 1:
-                        await asyncio.sleep(2)
+                    # 两次提交之间等待，让浏览器充分回收资源
+                    # if run_idx < REPEAT_COUNT - 1:
+                    #     await asyncio.sleep(8)
 
                 results.append(task_result)
 
