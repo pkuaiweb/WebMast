@@ -26,6 +26,7 @@ import time
 import re
 import os
 import sys
+import shutil
 from pathlib import Path
 from playwright.async_api import async_playwright
 
@@ -41,10 +42,10 @@ USER_DATA_DIR = str(PROJECT_DIR / "test-profile")
 
 REPEAT_COUNT = 3                  # 每个任务重复次数
 PAGE_LOAD_TIMEOUT = 60000         # 页面加载超时 (ms)
-ENGINE_READY_TIMEOUT = 900000     # 引擎加载超时 (ms), 首次下载模型较慢
+ENGINE_READY_TIMEOUT = 1200000     # 引擎加载超时 (ms), 首次下载模型较慢
 ANSWER_TIMEOUT = 90              # 等待回答超时 (秒)
 ANSWER_STABLE_SECONDS = 5         # 回答内容稳定多少秒视为完成
-WAIT_AFTER_PAGE_LOAD = 10          # 页面加载后等待 content script 注入的秒数
+WAIT_AFTER_PAGE_LOAD = 8          # 页面加载后等待 content script 注入的秒数
 NEED_LOGIN = False                 # 是否需要登录（首次运行时暂停让用户手动登录）
 BACKGROUND_TS_PATH = str(PROJECT_DIR / "src" / "background.ts")
 
@@ -67,14 +68,26 @@ def parse_background_constants() -> dict:
 
 
 async def get_extension_id(context) -> str:
-    """从 service worker 获取扩展 ID"""
-    if context.service_workers:
-        sw = context.service_workers[0]
-    else:
-        print("  等待扩展 service worker 注册...")
-        sw = await context.wait_for_event("serviceworker", timeout=30000)
+    """从 service worker 或 background page 获取扩展 ID"""
+    # 轮询等待 service worker 注册（持久化 profile 下 SW 可能延迟激活）
+    print("  等待扩展 service worker 注册...")
+    for attempt in range(30):
+        if context.service_workers:
+            sw = context.service_workers[0]
+            ext_id = sw.url.split("/")[2]
+            print(f"  扩展 ID (service worker): {ext_id}")
+            return ext_id
+        # MV2 fallback: 检查 background pages
+        if context.background_pages:
+            bg = context.background_pages[0]
+            ext_id = bg.url.split("/")[2]
+            print(f"  扩展 ID (background page): {ext_id}")
+            return ext_id
+        await asyncio.sleep(2)
 
-    # URL 格式: chrome-extension://{extension_id}/background.xxx.js
+    # 最终fallback: 等待 serviceworker 事件
+    print("  轮询未找到，等待 serviceworker 事件...")
+    sw = await context.wait_for_event("serviceworker", timeout=30000)
     ext_id = sw.url.split("/")[2]
     print(f"  扩展 ID: {ext_id}")
     return ext_id
@@ -276,7 +289,7 @@ async def main():
     bg_constants = parse_background_constants()
     model_short = bg_constants["model_id"]  # e.g. "Qwen3"
     wf_type = bg_constants["workflow_type"]
-    OUTPUT_PATH = os.path.join(OUTPUT_DIR, f"v5_results_{model_short}_wf{wf_type}.json")
+    OUTPUT_PATH = os.path.join(OUTPUT_DIR, f"v5_results_{model_short}_wf{wf_type}_headless_arm.json")
     print(f"Model ID: {bg_constants['model_id']}, Workflow Type: {wf_type}")
     print(f"输出文件: {OUTPUT_PATH}")
 
@@ -307,6 +320,25 @@ async def main():
         # 启动 Edge 浏览器（加载 WebMast 扩展）
         print("\n启动 Edge 浏览器...")
         os.makedirs(USER_DATA_DIR, exist_ok=True)
+
+        # 清除旧的扩展缓存，防止 rebuild 后旧 SW 残留导致新 SW 无法注册
+        # 注意：保留 Service Worker/CacheStorage/（WebLLM 模型权重缓存在这里）
+        sw_dir = os.path.join(USER_DATA_DIR, "Default", "Service Worker")
+        for sw_sub in ["Database", "ScriptCache"]:
+            path = os.path.join(sw_dir, sw_sub)
+            if os.path.isdir(path):
+                print(f"  清除缓存: Service Worker/{sw_sub}/")
+                shutil.rmtree(path, ignore_errors=True)
+
+        for subdir in [
+            os.path.join(USER_DATA_DIR, "Default", "Extension State"),
+            os.path.join(USER_DATA_DIR, "Default", "Extension Rules"),
+            os.path.join(USER_DATA_DIR, "Default", "Extension Scripts"),
+            os.path.join(USER_DATA_DIR, "Default", "Code Cache"),
+        ]:
+            if os.path.isdir(subdir):
+                print(f"  清除缓存: {os.path.basename(subdir)}/")
+                shutil.rmtree(subdir, ignore_errors=True)
 
         context = await p.chromium.launch_persistent_context(
             user_data_dir=USER_DATA_DIR,
@@ -379,6 +411,7 @@ async def main():
 
                     # 每次 run 都关闭并重新打开 sidebar，确保状态干净
                     try:
+                        await asyncio.sleep(2)  # 等待可能的后台处理完成
                         await sidebar_page.close()
                         await asyncio.sleep(1)
                     except Exception:
@@ -414,9 +447,6 @@ async def main():
                     print(f"    TTFT: {ttft}s")
                     print(f"    Answer: {answer_preview}")
 
-                    # 两次提交之间等待，让浏览器充分回收资源
-                    # if run_idx < REPEAT_COUNT - 1:
-                    #     await asyncio.sleep(8)
 
                 results.append(task_result)
 

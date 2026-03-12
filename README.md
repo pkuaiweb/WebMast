@@ -77,12 +77,22 @@ The extension is split into three isolated execution contexts that communicate v
 
 ### 1. Build
 
+**Option A — Build from source**
+
 ```bash
 npm install
 npm run build
 ```
 
 The bundled extension is written to `./dist/` by [Parcel](https://parceljs.org/) using `@parcel/config-webextension`.
+
+**Option B — Download pre-built package**
+
+Download the latest `dist.zip` from the [Releases](../../releases) page and unzip it to obtain the `./dist/` directory:
+
+```bash
+unzip dist.zip
+```
 
 ### 2. Load into Chrome
 

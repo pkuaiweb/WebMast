@@ -329,3 +329,6 @@ coverage
 
 package-lock.json
 src/build-info.json
+
+*.zip
+/test-profile
