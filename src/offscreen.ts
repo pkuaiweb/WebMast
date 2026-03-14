@@ -300,7 +300,7 @@ async function chatCompletionStream(
           data: { requestId, error: "Request aborted", done: true }
         }).catch(() => { });
       },
-    });
+    }, MILD_REPEAT_CONFIG);
   } catch (err) {
     console.warn("[Offscreen] Stream error:", err);
     chrome.runtime.sendMessage({

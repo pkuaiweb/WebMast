@@ -49,10 +49,10 @@ interface EngineInitResult {
 
 const SUMMARY_CACHE_PREFIX = "page_summary_";
 const PENDING_CACHE_PREFIX = "pending_page_";
-const DEFAULT_MODEL_ID = "Phi-3.5-mini-instruct-q4f16_1-MLC"//"Qwen3-1.7B-q4f16_1-MLC" //"Llama-3.2-1B-Instruct-q4f16_1-MLC"// "Llama-3.2-3B-Instruct-q4f32_1-MLC";
+const DEFAULT_MODEL_ID = "Qwen3-1.7B-q4f16_1-MLC" // "Phi-3.5-mini-instruct-q4f16_1-MLC"// "Llama-3.2-1B-Instruct-q4f16_1-MLC"// "Llama-3.2-3B-Instruct-q4f32_1-MLC";
 const MODEL_STORAGE_KEY = "selected_model_id";
-const USE_SUMMARY_CACHE = false; // 是否启用摘要缓存
-const WORKFLOW_TYPE: number = 5; // 1: 直接拼接，2: content提取，3: summary提取，4: summary评估+回退，5: 子问题+content，6: 子问题+summary评估+回退
+const USE_SUMMARY_CACHE = true; // 是否启用摘要缓存
+const DATA_FLOW_TYPE: number = 2; // 1: 直接拼接，2: content提取，3: summary提取，4: summary评估+回退，5: 子问题+content，6: 子问题+summary评估+回退
 let currentModelId = DEFAULT_MODEL_ID;
 
 // Load model ID from storage
@@ -94,6 +94,15 @@ const streamPorts = new Map<string, chrome.runtime.Port>();
 
 // silentChat 的 reject 回调，用于 abort 时拒绝 pending promise
 const pendingRejects = new Map<string, (reason: Error) => void>();
+
+// 用户提问优先级控制
+let userQueryPending = false;
+let summarizationYieldedResolve: (() => void) | null = null;
+let summarizationResumePromise: Promise<void> | null = null;
+let summarizationResumeResolve: (() => void) | null = null;
+
+// Streaming 完成回调（用于等待流式生成结束）
+const streamCompletionCallbacks = new Map<string, () => void>();
 
 // ==================== Offscreen Document 管理 ====================
 
@@ -407,7 +416,7 @@ function buildSingleTabPrompt(
   return [
     {
       role: "system",
-      content: `You are a helpful assistant. Here is the content of the browser tab:\n\n${pageContext}\n\nPlease answer questions about this webpage. Keep your response concise and do NOT repeat the same information.`
+      content: `You are a helpful assistant. Here is the content of the browser tab:\n\n${pageContext.substring(0, CONFIG.maxContentLength)}\n\nPlease answer questions about this webpage. Keep your response concise and do NOT repeat the same information.`
     },
     { role: "user", content: `QUESTION: ${userMessage}` }
   ];
@@ -461,7 +470,7 @@ function buildMultiTabFinalPrompt(
   return [
     {
       role: "system",
-      content: `You are a helpful assistant. Below is the extracted information from ${tabs.length} tabs:\n\n${combinedContext}\n\n`
+      content: `You are a helpful assistant. Below is the extracted information from ${tabs.length} tabs:\n\n${combinedContext.substring(0, CONFIG.maxContentLength)}\n\n`
         + `Instructions:\n`
         + `- Answer the question strictly based on the information from the tabs above.\n`
         + `- When the question references information across multiple tabs, you MUST cross-reference: look up the value from one tab and match/compare it against the data from the other tab.\n`
@@ -480,11 +489,20 @@ function buildSummarizePagePrompt(
   return [
     {
       role: "system",
-      content: "You are a helpful assistant that summarizes web pages. Create a concise summary with key points (5-10 bullet points). Focus on: main topics, key facts, important details, and actionable information. Be brief but comprehensive."
+      content: [
+        "You are a helpful assistant that summarizes web pages into concise bullet points.",
+        "",
+        "Rules:",
+        "- Produce concise bullet points covering the main topics, key facts, and important details.",
+        "- ALWAYS include exact numbers (prices, ratings, counts, dates, percentages, quantities) — these are critical.",
+        "- Each bullet point must convey a distinct piece of information. Do NOT repeat the same point in different words.",
+        "- Use short, factual statements. No conversational filler, no greetings, no meta-commentary.",
+        "- Do NOT speculate or add information not present in the content.",
+      ].join("\n")
     },
     {
       role: "user",
-      content: `Summarize this webpage:\n\nTitle: ${title}\n\nContent:\n${content}`
+      content: `Summarize this webpage:\n\nTitle: ${title}\n\nContent:\n${content.substring(0, CONFIG.maxContentLength)}`
     }
   ];
 }
@@ -575,10 +593,10 @@ async function processMultiTabQuery(
     };
   }
 
-  console.log(`[Background] Processing ${allTabContents.length} tabs with WORKFLOW_TYPE=${WORKFLOW_TYPE}...`);
+  console.log(`[Background] Processing ${allTabContents.length} tabs with DATA FLOW_TYPE=${DATA_FLOW_TYPE}...`);
 
-  // ---------- WORKFLOW 1: 直接把原始内容当作 compressed，跳过中间推理 ----------
-  if (WORKFLOW_TYPE === 1) {
+  // ---------- DATA FLOW 1: 直接把原始内容当作 compressed，跳过中间推理 ----------
+  if (DATA_FLOW_TYPE === 1) {
     const tabsWithContent = allTabContents.map(tabInfo => ({
       index: tabInfo.index,
       title: tabInfo.title,
@@ -591,9 +609,9 @@ async function processMultiTabQuery(
     };
   }
 
-  // ---------- 对于 WORKFLOW 5 / 6: 先生成子问题 ----------
+  // ---------- 对于 DATA FLOW 5 / 6: 先生成子问题 ----------
   let subQuestions: Map<number, string> | null = null;
-  if (WORKFLOW_TYPE === 5 || WORKFLOW_TYPE === 6) {
+  if (DATA_FLOW_TYPE === 5 || DATA_FLOW_TYPE === 6) {
     const tabMeta = allTabContents.map(t => ({ index: t.index, title: t.title }));
     const subQPrompt = buildSubQuestionGenerationPrompt(tabMeta, userMessage);
     try {
@@ -627,8 +645,8 @@ async function processMultiTabQuery(
     let compressedContent = "";
 
     try {
-      switch (WORKFLOW_TYPE) {
-        // --- WORKFLOW 2: 用 userMessage + content 提取 ---
+      switch (DATA_FLOW_TYPE) {
+        // --- DATA FLOW 2: 用 userMessage + content 提取 ---
         case 2: {
           const msgs = buildExtractFromContentPrompt(tabInfo.content, userMessage, tabInfo.index);
           compressedContent = await silentChat(msgs, port);
@@ -636,7 +654,7 @@ async function processMultiTabQuery(
           break;
         }
 
-        // --- WORKFLOW 3: 用 userMessage + cachedSummary 提取 ---
+        // --- DATA FLOW 3: 用 userMessage + cachedSummary 提取 ---
         case 3: {
           const source = tabInfo.cachedSummary || tabInfo.content;
           const msgs = buildExtractFromContentPrompt(source, userMessage, tabInfo.index);
@@ -645,7 +663,7 @@ async function processMultiTabQuery(
           break;
         }
 
-        // --- WORKFLOW 4: 先评估 cachedSummary，不足则回退 content ---
+        // --- DATA FLOW 4: 先评估 cachedSummary，不足则回退 content ---
         case 4: {
           if (tabInfo.cachedSummary) {
             const evalMsgs = buildSummaryEvaluationPrompt(tabInfo.cachedSummary, userMessage);
@@ -669,7 +687,7 @@ async function processMultiTabQuery(
           break;
         }
 
-        // --- WORKFLOW 5: 子问题 + content 提取 ---
+        // --- DATA FLOW 5: 子问题 + content 提取 ---
         case 5: {
           const msgs = buildExtractFromContentPrompt(tabInfo.content, tabQuestion, tabInfo.index);
           compressedContent = await silentChat(msgs, port);
@@ -677,7 +695,7 @@ async function processMultiTabQuery(
           break;
         }
 
-        // --- WORKFLOW 6: 子问题 + 先评估 cachedSummary，不足则回退 content ---
+        // --- DATA FLOW 6: 子问题 + 先评估 cachedSummary，不足则回退 content ---
         case 6: {
           if (tabInfo.cachedSummary) {
             const evalMsgs = buildSummaryEvaluationPrompt(tabInfo.cachedSummary, tabQuestion);
@@ -700,7 +718,7 @@ async function processMultiTabQuery(
         }
 
         default:
-          console.warn(`[Background] Unknown WORKFLOW_TYPE: ${WORKFLOW_TYPE}, falling back to WF2`);
+          console.warn(`[Background] Unknown DATA FLOW_TYPE: ${DATA_FLOW_TYPE}, falling back to WF2`);
           const msgs = buildExtractFromContentPrompt(tabInfo.content, userMessage, tabInfo.index);
           compressedContent = await silentChat(msgs, port);
           break;
@@ -740,8 +758,51 @@ async function summarizePage(
   const messages = buildSummarizePagePrompt(title, content);
 
   const summary = await silentChat(messages);
-  console.log("[Background] Summary generated:", summary.length, "chars");
+  console.log("[Background] Summary generated:", summary.length, "chars\n"+summary);
   return { summary };
+}
+
+// ==================== 用户提问优先级控制 ====================
+
+/**
+ * 请求暂停摘要队列，等待当前正在进行的任务完成后让出引擎。
+ * 如果摘要队列未在运行，则立即返回。
+ */
+async function pauseSummarizationForUserQuery(): Promise<void> {
+  if (!isSummarizing) return;
+  if (userQueryPending) return; // 已经暂停
+
+  userQueryPending = true;
+  console.log("[Background] Requesting summarization pause for user query...");
+
+  // 创建恢复 Promise（摘要循环将等待此 Promise）
+  summarizationResumePromise = new Promise<void>(resolve => {
+    summarizationResumeResolve = resolve;
+  });
+
+  // 等待摘要循环实际让出（当前任务完成后触发）
+  await new Promise<void>(resolve => {
+    summarizationYieldedResolve = resolve;
+  });
+
+  console.log("[Background] Summarization paused, engine available for user query");
+}
+
+/**
+ * 恢复摘要队列处理。
+ * 在用户提问的流式生成完成（或出错/断开）后调用。
+ */
+function resumeSummarization(): void {
+  if (!userQueryPending) return;
+
+  userQueryPending = false;
+  console.log("[Background] Resuming summarization queue");
+
+  if (summarizationResumeResolve) {
+    summarizationResumeResolve();
+    summarizationResumeResolve = null;
+  }
+  summarizationResumePromise = null;
 }
 
 // ==================== 摘要队列处理 ====================
@@ -768,8 +829,6 @@ async function processSummarizationQueue() {
       continue;
     }
 
-    console.log("[Background] Summarizing:", pageData.title);
-
     try {
       const response = await summarizePage(
         pageData.url,
@@ -786,11 +845,23 @@ async function processSummarizationQueue() {
           contentLength: pageData.content.length
         });
         await removePendingPage(url);
-        console.log("[Background] Summary saved:", pageData.title, response.summary);
       }
     } catch (err) {
       console.error("[Background] Summarization failed:", err);
       await removePendingPage(url);
+    }
+
+    // 每完成一个任务后检查：如果有用户提问等待，让出引擎
+    if (userQueryPending) {
+      console.log("[Background] Summarization yielding for user query");
+      if (summarizationYieldedResolve) {
+        summarizationYieldedResolve();
+        summarizationYieldedResolve = null;
+      }
+      if (summarizationResumePromise) {
+        await summarizationResumePromise;
+      }
+      console.log("[Background] Summarization resumed after user query");
     }
   }
 
@@ -858,6 +929,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         port.postMessage({ type: "chunk", data: chunk });
         if (chunk.done || chunk.error) {
           streamPorts.delete(chunk.requestId);
+          // 通知 startStreaming 的等待方：流式生成已结束
+          const completionCb = streamCompletionCallbacks.get(chunk.requestId);
+          if (completionCb) {
+            completionCb();
+            streamCompletionCallbacks.delete(chunk.requestId);
+          }
         }
       }
       sendResponse({ status: "acknowledged" });
@@ -970,6 +1047,10 @@ async function ensureEngineReadyForPort(port: chrome.runtime.Port): Promise<bool
   return true;
 }
 
+/**
+ * 启动流式生成，返回的 Promise 在流式生成完成（done / error）时 resolve。
+ * 这确保调用方可以 await 等待引擎空闲后再恢复摘要队列。
+ */
 async function startStreaming(port: chrome.runtime.Port, messages: any[]): Promise<void> {
   if (!await ensureEngineReadyForPort(port)) return;
   messages = appendNothinkIfQwen3(messages);
@@ -979,26 +1060,31 @@ async function startStreaming(port: chrome.runtime.Port, messages: any[]): Promi
   // 注册端口用于接收 streaming 响应
   streamPorts.set(requestId, port);
 
-  // 也注册到端口的活跃请求集合
-  // const activeSet = portActiveRequests.get(port);
-  // activeSet?.add(requestId);
+  return new Promise<void>((resolve) => {
+    // 注册完成回调 —— 当 STREAM_CHUNK 收到 done/error 或端口断开时触发
+    streamCompletionCallbacks.set(requestId, resolve);
 
-  // 发送请求到 offscreen
-  chrome.runtime.sendMessage({
-    type: "CHAT_COMPLETION_STREAM",
-    data: {
-      requestId,
-      messages: messages
-    }
-  }, (response) => {
-    if (chrome.runtime.lastError) {
-      port.postMessage({ type: "error", error: chrome.runtime.lastError.message });
-      streamPorts.delete(requestId);
-    } else if (response?.error) {
-      console.error("[Background] Stream start error:", response.error);
-      port.postMessage({ type: "error", error: response.error });
-      streamPorts.delete(requestId);
-    }
+    // 发送请求到 offscreen
+    chrome.runtime.sendMessage({
+      type: "CHAT_COMPLETION_STREAM",
+      data: {
+        requestId,
+        messages: messages
+      }
+    }, (response) => {
+      if (chrome.runtime.lastError) {
+        port.postMessage({ type: "error", error: chrome.runtime.lastError.message });
+        streamPorts.delete(requestId);
+        streamCompletionCallbacks.delete(requestId);
+        resolve();
+      } else if (response?.error) {
+        console.error("[Background] Stream start error:", response.error);
+        port.postMessage({ type: "error", error: response.error });
+        streamPorts.delete(requestId);
+        streamCompletionCallbacks.delete(requestId);
+        resolve();
+      }
+    });
   });
 }
 
@@ -1015,7 +1101,13 @@ chrome.runtime.onConnect.addListener((port) => {
     port.onMessage.addListener(async (message) => {
       if (message.type === "CHAT_STREAM_START") {
         // 直接 streaming：sidebar 已构建好 messages
-        await startStreaming(port, message.messages);
+        // 暂停摘要队列，等待当前摘要任务完成后让出引擎
+        await pauseSummarizationForUserQuery();
+        try {
+          await startStreaming(port, message.messages);
+        } finally {
+          resumeSummarization();
+        }
       } else if (message.type === "PROCESS_AND_STREAM") {
         // 合并请求：background 自行收集标签页内容 + 处理多标签页 + streaming
         try {
@@ -1023,25 +1115,34 @@ chrome.runtime.onConnect.addListener((port) => {
 
           const { userMessage, useContext } = message;
 
-          // Background 自行收集标签页内容
+          // 先收集标签页内容（不需要 LLM 引擎，可在摘要运行时并行执行）
+          // 必须在 pauseSummarizationForUserQuery 之前调用，
+          // 否则 await 内部 Promise 会打断 service worker 事件上下文，
+          // 导致 chrome.tabs.query 返回空数组。
           let tabContents: TabContentInfo[] = [];
           if (useContext) {
             tabContents = await fetchAllTabContents();
             console.log(`[Background] Fetched ${tabContents.length} tabs`);
           }
 
+          // 暂停摘要队列，等待当前摘要任务完成后让出引擎
+          await pauseSummarizationForUserQuery();
+
           const queryResult = await processMultiTabQuery(tabContents, userMessage, port);
 
           if (!queryResult.success || !queryResult.finalMessages) {
             port.postMessage({ type: "error", error: queryResult.error || "Failed to process query" });
+            resumeSummarization();
             return;
           }
 
           // 直接将处理结果发送 streaming，中间结果不经由 sidebar
           await startStreaming(port, queryResult.finalMessages);
+          resumeSummarization();
         } catch (err) {
           console.error("[Background] Error in PROCESS_AND_STREAM:", err);
           port.postMessage({ type: "error", error: String(err) });
+          resumeSummarization();
         }
       }
     });
@@ -1066,6 +1167,13 @@ chrome.runtime.onConnect.addListener((port) => {
             }
           });
 
+          // 解决 startStreaming 的完成回调（避免 Promise 永远 pending）
+          const completionCb = streamCompletionCallbacks.get(requestId);
+          if (completionCb) {
+            completionCb();
+            streamCompletionCallbacks.delete(requestId);
+          }
+
           // 拒绝 silentChat 的 pending promise
           const rejectFn = pendingRejects.get(requestId);
           if (rejectFn) {
@@ -1075,6 +1183,9 @@ chrome.runtime.onConnect.addListener((port) => {
           }
         }
       }
+
+      // 端口断开时恢复摘要队列（如果之前因用户提问而暂停）
+      resumeSummarization();
     });
   }
 });
