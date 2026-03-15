@@ -51,6 +51,15 @@ const MILD_REPEAT_CONFIG = {
   top_p: 0.9,
 };
 
+const initProgressCallback = (report: { progress: number; text: string }) => {
+  const progress = report.progress;
+  console.log("[Offscreen] Engine init progress:", Math.round(progress * 100) + "%", "-", report.text);
+  chrome.runtime.sendMessage({
+    type: "ENGINE_INIT_PROGRESS",
+    data: { progress, text: report.text }
+  }).catch(() => { });
+};
+
 /**
  * 流式复读检测器
  * 检测连续 n-gram 重复，若最近窗口内重复率过高则报告复读。
@@ -95,25 +104,9 @@ class RepetitionDetector {
 
 // ==================== 引擎初始化 ====================
 
-/** 进度回调（initializeEngine / reloadModel 共用） */
-function makeProgressCallback() {
-  return (report: { progress: number; text: string }) => {
-    const progress = report.progress;
-    console.log("[Offscreen] Engine init progress:", Math.round(progress * 100) + "%", "-", report.text);
-    chrome.runtime.sendMessage({
-      type: "ENGINE_INIT_PROGRESS",
-      data: { progress, text: report.text }
-    }).catch(() => { });
-  };
-}
-
-/**
- * 首次创建引擎（CreateMLCEngine）。
- * 仅在 engine === null 时调用。
- */
 async function initializeEngine(modelId: string) {
   // If same model is already initialized, return ready
-  if (engine && currentModelId === modelId && engineReady) {
+  if (currentModelId === modelId && engineReady) {
     console.log("[Offscreen] Engine already initialized with model:", modelId);
     return { status: "ready" };
   }
@@ -124,18 +117,29 @@ async function initializeEngine(modelId: string) {
     return { status: "initializing" };
   }
 
+  engineReady = false;
   isEngineInitializing = true;
   currentModelId = modelId;
-  console.log("[Offscreen] Creating engine with model:", modelId);
+
+
 
   try {
-    engine = await CreateMLCEngine(modelId, {
-      initProgressCallback: makeProgressCallback(),
-    });
+    if (engine) {
+      // 复用已有引擎，仅重新加载模型（保留 WebGPU device）
+      console.log("[Offscreen] Reloading engine with model:", modelId);
+      engine.setInitProgressCallback(initProgressCallback);
+      await engine.reload(modelId);
+    } else {
+      // 首次创建引擎
+      console.log("[Offscreen] Creating engine with model:", modelId);
+      engine = await CreateMLCEngine(modelId, { initProgressCallback });
+    }
 
     engineReady = true;
+    isEngineInitializing = false;
     console.log("[Offscreen] Engine initialized successfully!");
 
+    // 通知 background 引擎就绪
     chrome.runtime.sendMessage({
       type: "ENGINE_READY",
       data: { modelId }
@@ -145,6 +149,7 @@ async function initializeEngine(modelId: string) {
 
   } catch (err) {
     console.error("[Offscreen] Failed to initialize engine:", err);
+    isEngineInitializing = false;
 
     chrome.runtime.sendMessage({
       type: "ENGINE_ERROR",
@@ -152,64 +157,7 @@ async function initializeEngine(modelId: string) {
     }).catch(() => { });
 
     return { status: "error", error: String(err) };
-
-  } finally {
-    isEngineInitializing = false;
-  }
-}
-
-/**
- * 切换模型 —— 复用已有引擎实例，仅重新加载模型权重（保留 WebGPU device）。
- * 要求 engine 已存在。
- */
-async function reloadModel(modelId: string) {
-  if (!engine) {
-    console.warn("[Offscreen] reloadModel called but engine is null, falling back to initializeEngine");
-    return initializeEngine(modelId);
-  }
-
-  if (currentModelId === modelId && engineReady) {
-    console.log("[Offscreen] Already loaded model:", modelId);
-    return { status: "ready" };
-  }
-
-  if (isEngineInitializing) {
-    console.log("[Offscreen] Engine is busy initializing, cannot reload now");
-    return { status: "initializing" };
-  }
-
-  isEngineInitializing = true;
-  engineReady = false;
-  currentModelId = modelId;
-  console.log("[Offscreen] Reloading model:", modelId);
-
-  try {
-    engine.setInitProgressCallback(makeProgressCallback());
-    await engine.reload(modelId);
-
-    engineReady = true;
-    console.log("[Offscreen] Model reloaded successfully!");
-
-    chrome.runtime.sendMessage({
-      type: "ENGINE_READY",
-      data: { modelId }
-    }).catch(() => { });
-
-    return { status: "ready" };
-
-  } catch (err) {
-    console.error("[Offscreen] Failed to reload model:", err);
-
-    chrome.runtime.sendMessage({
-      type: "ENGINE_ERROR",
-      data: { error: String(err) }
-    }).catch(() => { });
-
-    return { status: "error", error: String(err) };
-
-  } finally {
-    isEngineInitializing = false;
-  }
+  } 
 }
 
 // ==================== Chat Completion ====================
@@ -312,13 +260,6 @@ async function chatCompletionStream(
   requestId: string,
   messages: ChatCompletionMessageParam[]
 ): Promise<void> {
-  if (!engine || !engineReady) {
-    chrome.runtime.sendMessage({
-      type: "STREAM_CHUNK",
-      data: { requestId, error: "Engine not ready" }
-    });
-    return;
-  }
 
   try {
     await generateCore(requestId, messages, {
@@ -382,14 +323,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return true;
       }
       initializeEngine(message.data.modelId).then(sendResponse);
-      return true;
-
-    case "RELOAD_MODEL":
-      if (!message.data?.modelId) {
-        sendResponse({ status: "error", error: "modelId is required" });
-        return true;
-      }
-      reloadModel(message.data.modelId).then(sendResponse);
       return true;
 
     case "CHAT_COMPLETION":
