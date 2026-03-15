@@ -52,7 +52,7 @@ const PENDING_CACHE_PREFIX = "pending_page_";
 const DEFAULT_MODEL_ID = "Qwen3-1.7B-q4f16_1-MLC" // "Phi-3.5-mini-instruct-q4f16_1-MLC"// "Llama-3.2-1B-Instruct-q4f16_1-MLC"// "Llama-3.2-3B-Instruct-q4f32_1-MLC";
 const MODEL_STORAGE_KEY = "selected_model_id";
 const USE_SUMMARY_CACHE = true; // 是否启用摘要缓存
-const DATA_FLOW_TYPE: number = 2; // 1: 直接拼接，2: content提取，3: summary提取，4: summary评估+回退，5: 子问题+content，6: 子问题+summary评估+回退
+const DATA_FLOW_TYPE: number = 6; // 1: 直接拼接，2: content提取，3: summary提取，4: summary评估+回退，5: 子问题+content，6: 子问题+summary评估+回退
 let currentModelId = DEFAULT_MODEL_ID;
 
 // Load model ID from storage
@@ -140,15 +140,18 @@ async function ensureOffscreenDocument(): Promise<boolean> {
   }
 }
 
-async function initializeEngine(forceModelId?: string): Promise<EngineInitResult> {
-  const modelId = forceModelId || currentModelId;
+/**
+ * 首次创建引擎（发送 INIT_ENGINE 到 offscreen）。
+ * 用于启动时加载 和 ensureEngineReadyForPort。
+ */
+async function initializeEngine(): Promise<EngineInitResult> {
+  const modelId = currentModelId;
 
-  if (offscreenEngineReady && !forceModelId) {
+  if (offscreenEngineReady) {
     return { status: "ready", modelId };
   }
 
-  // 如果已经在初始化相同的模型，直接返回
-  if (isEngineInitializing && !forceModelId) {
+  if (isEngineInitializing) {
     console.log("[Background] Engine already initializing, skipping duplicate request");
     return { status: "initializing", modelId };
   }
@@ -161,32 +164,56 @@ async function initializeEngine(forceModelId?: string): Promise<EngineInitResult
   isEngineInitializing = true;
   console.log("[Background] Initializing engine with model:", modelId);
 
-  // 发送初始化请求到 offscreen
+  // 仅发送消息，状态由 ENGINE_READY / ENGINE_ERROR 回调更新
   return new Promise((resolve) => {
     chrome.runtime.sendMessage({
       type: "INIT_ENGINE",
-      data: { modelId: modelId }
+      data: { modelId }
     }, (response) => {
       if (chrome.runtime.lastError) {
         console.error("[Background] Init engine error:", chrome.runtime.lastError);
-        isEngineInitializing = false;
         resolve({ status: "error", modelId, error: chrome.runtime.lastError.message });
-      } else if (response?.status === "ready") {
-        // 同步更新本地状态（应对 background 重启后 offscreen 已就绪的场景）
-        offscreenEngineReady = true;
-        engineInitProgress = 1;
-        isEngineInitializing = false;
-        currentModelId = modelId;
-        resolve({ status: "ready", modelId });
-      } else if (response?.status === "initializing") {
-        resolve({ status: "initializing", modelId });
+      } else if (response?.status === "ready" || response?.status === "initializing") {
+        resolve({ status: response.status, modelId });
       } else if (response?.status === "error") {
         console.error("[Background] Init engine returned error:", response.error);
-        isEngineInitializing = false;
         resolve({ status: "error", modelId, error: response.error || "Unknown engine error" });
       } else {
-        isEngineInitializing = false;
         resolve({ status: "error", modelId, error: "Unknown response from offscreen" });
+      }
+    });
+  });
+}
+
+/**
+ * 切换模型（发送 RELOAD_MODEL 到 offscreen）。
+ * 复用已有引擎实例和 WebGPU device，仅重新加载模型权重。
+ */
+async function reloadModel(newModelId: string): Promise<EngineInitResult> {
+  const created = await ensureOffscreenDocument();
+  if (!created) {
+    return { status: "error", modelId: newModelId, error: "Failed to create offscreen document" };
+  }
+
+  isEngineInitializing = true;
+  console.log("[Background] Reloading model:", newModelId);
+
+  // 仅发送消息，状态由 ENGINE_READY / ENGINE_ERROR 回调更新
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({
+      type: "RELOAD_MODEL",
+      data: { modelId: newModelId }
+    }, (response) => {
+      if (chrome.runtime.lastError) {
+        console.error("[Background] Reload model error:", chrome.runtime.lastError);
+        resolve({ status: "error", modelId: newModelId, error: chrome.runtime.lastError.message });
+      } else if (response?.status === "ready" || response?.status === "initializing") {
+        resolve({ status: response.status, modelId: newModelId });
+      } else if (response?.status === "error") {
+        console.error("[Background] Reload model returned error:", response.error);
+        resolve({ status: "error", modelId: newModelId, error: response.error || "Unknown engine error" });
+      } else {
+        resolve({ status: "error", modelId: newModelId, error: "Unknown response from offscreen" });
       }
     });
   });
@@ -906,7 +933,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       engineInitProgress = 1;
       isEngineInitializing = false;
       console.log("[Background] Engine ready!");
-      processSummarizationQueue();
       sendResponse({ status: "acknowledged" });
       return true;
 
@@ -966,7 +992,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       currentModelId = newModelId;
       offscreenEngineReady = false;
       engineInitProgress = 0;
-      isEngineInitializing = true;  // Set IMMEDIATELY to prevent race with INIT_ENGINE_REQUEST
+      isEngineInitializing = true; 
 
       // Save to storage (fire and forget)
       saveModelIdToStorage(newModelId).catch(err =>
@@ -976,9 +1002,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // 立即返回响应，让 popup 可以开始轮询进度
       sendResponse({ success: true, status: "loading", modelId: newModelId });
 
-      // 异步初始化引擎（不等待完成）
-      initializeEngine(newModelId).catch(err =>
-        console.error("[Background] Engine init failed:", err)
+      // 异步重新加载模型（不等待完成）
+      reloadModel(newModelId).catch(err =>
+        console.error("[Background] Model reload failed:", err)
       );
       return true;
     }
@@ -989,11 +1015,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       });
       return true;
 
-    case "INIT_ENGINE_REQUEST":
-      initializeEngine().then((result) => {
-        sendResponse({ status: result.status, modelId: result.modelId, error: result.error });
-      });
-      return true;
 
     // ==================== 页面内容处理 ====================
     case "PAGE_LOADED": {
@@ -1196,28 +1217,14 @@ chrome.runtime.onConnect.addListener((port) => {
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
 
 // 启动时加载保存的模型 ID 并创建 offscreen document，然后开始初始化引擎
-loadModelIdFromStorage().then(savedModelId => {
-  currentModelId = savedModelId;
+(async () => {
+  currentModelId = await loadModelIdFromStorage();
   console.log("[Background] Loaded model ID from storage:", currentModelId);
 
-  ensureOffscreenDocument().then(() => {
-    console.log("[Background] Offscreen document ready, checking engine status...");
+  await ensureOffscreenDocument();
+  console.log("[Background] Offscreen document ready, checking engine status...");
 
-    // 先查询 offscreen 当前状态（应对 background 重启但 offscreen 仍运行的场景）
-    chrome.runtime.sendMessage({ type: "CHECK_ENGINE_STATUS" }, (statusResponse) => {
-      if (!chrome.runtime.lastError && statusResponse?.ready && statusResponse?.modelId === currentModelId) {
-        // offscreen 引擎已就绪，直接同步状态，无需重新加载
-        offscreenEngineReady = true;
-        engineInitProgress = 1;
-        isEngineInitializing = false;
-        console.log("[Background] Engine already ready in offscreen, state recovered.");
-        processSummarizationQueue();
-      } else {
-        // offscreen 引擎未就绪，正常初始化
-        initializeEngine().then(result => {
-          console.log("[Background] Initial engine load result:", result.status);
-        });
-      }
-    });
-  });
-});
+  // 先查询 offscreen 当前状态（应对 background 重启但 offscreen 仍运行的场景）
+  const result = await initializeEngine();
+  console.log("[Background] Initial engine load result:", result.status);
+})();
