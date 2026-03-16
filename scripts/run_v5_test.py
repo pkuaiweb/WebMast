@@ -51,7 +51,7 @@ BACKGROUND_TS_PATH = str(PROJECT_DIR / "src" / "background.ts")
 
 
 def parse_background_constants() -> dict:
-    """从 background.ts 中解析 DEFAULT_MODEL_ID 和 WORKFLOW_TYPE"""
+    """从 background.ts 中解析 DEFAULT_MODEL_ID 和 DATA_FLOW_TYPE"""
     result = {"model_id": "unknown", "workflow_type": "unknown"}
     try:
         with open(BACKGROUND_TS_PATH, "r", encoding="utf-8") as f:
@@ -59,7 +59,7 @@ def parse_background_constants() -> dict:
         m = re.search(r'const\s+DEFAULT_MODEL_ID\s*=\s*"([^"]+)"', content)
         if m:
             result["model_id"] = m.group(1)
-        m = re.search(r'const\s+WORKFLOW_TYPE\s*:\s*number\s*=\s*(\d+)', content)
+        m = re.search(r'const\s+DATA_FLOW_TYPE\s*:\s*number\s*=\s*(\d+)', content)
         if m:
             result["workflow_type"] = int(m.group(1))
     except Exception as e:
