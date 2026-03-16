@@ -52,7 +52,7 @@ const PENDING_CACHE_PREFIX = "pending_page_";
 const DEFAULT_MODEL_ID = "Qwen3-1.7B-q4f16_1-MLC" // "Phi-3.5-mini-instruct-q4f16_1-MLC"// "Llama-3.2-1B-Instruct-q4f16_1-MLC"// "Llama-3.2-3B-Instruct-q4f32_1-MLC";
 const MODEL_STORAGE_KEY = "selected_model_id";
 const USE_SUMMARY_CACHE = true; // 是否启用摘要缓存
-const DATA_FLOW_TYPE: number = 6; // 1: 直接拼接，2: content提取，3: summary提取，4: summary评估+回退，5: 子问题+content，6: 子问题+summary评估+回退
+const DATA_FLOW_TYPE: number = 1; // 1: 直接拼接，2: content提取，3: summary提取，4: summary评估+回退，5: 子问题+content，6: 子问题+summary评估+回退
 let currentModelId = DEFAULT_MODEL_ID;
 
 // Load model ID from storage
@@ -97,9 +97,6 @@ const pendingRejects = new Map<string, (reason: Error) => void>();
 
 // 用户提问优先级控制
 let userQueryPending = false;
-let summarizationYieldedResolve: (() => void) | null = null;
-let summarizationResumePromise: Promise<void> | null = null;
-let summarizationResumeResolve: (() => void) | null = null;
 
 // Streaming 完成回调（用于等待流式生成结束）
 const streamCompletionCallbacks = new Map<string, () => void>();
@@ -466,7 +463,7 @@ function buildMultiTabFinalPrompt(
   return [
     {
       role: "system",
-      content: `You are a helpful assistant. Below is the extracted information from ${tabs.length} tabs:\n\n${combinedContext.substring(0, CONFIG.maxContentLength)}\n\n`
+      content: `You are a helpful assistant. Below is the extracted information from ${tabs.length} tabs:\n\n${combinedContext.substring(0, CONFIG.maxContentLength*2)}\n\n`
         + `Instructions:\n`
         + `- Answer the question strictly based on the information from the tabs above.\n`
         + `- When the question references information across multiple tabs, you MUST cross-reference: look up the value from one tab and match/compare it against the data from the other tab.\n`
@@ -761,108 +758,85 @@ async function summarizePage(
 // ==================== 用户提问优先级控制 ====================
 
 /**
- * 请求暂停摘要队列，等待当前正在进行的任务完成后让出引擎。
- * 如果摘要队列未在运行，则立即返回。
+ * 标记用户提问开始，阻止摘要轮询启动新任务。
+ * 如果当前有摘要任务在跑，等待其完成后再返回（确保引擎空闲）。
  */
 async function pauseSummarizationForUserQuery(): Promise<void> {
-  if (!isSummarizing) return;
-  if (userQueryPending) return; // 已经暂停
-
+  if (userQueryPending) return;
   userQueryPending = true;
-  console.log("[Background] Requesting summarization pause for user query...");
 
-  // 创建恢复 Promise（摘要循环将等待此 Promise）
-  summarizationResumePromise = new Promise<void>(resolve => {
-    summarizationResumeResolve = resolve;
-  });
-
-  // 等待摘要循环实际让出（当前任务完成后触发）
-  await new Promise<void>(resolve => {
-    summarizationYieldedResolve = resolve;
-  });
-
+  // 等待正在进行的摘要任务完成（轮询 isSummarizing 标志）
+  while (isSummarizing) {
+    console.log("[Background] Waiting for in-flight summarization to finish...");
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
   console.log("[Background] Summarization paused, engine available for user query");
 }
 
 /**
- * 恢复摘要队列处理。
- * 在用户提问的流式生成完成（或出错/断开）后调用。
+ * 标记用户提问结束，允许摘要轮询恢复处理。
  */
 function resumeSummarization(): void {
   if (!userQueryPending) return;
-
   userQueryPending = false;
-  console.log("[Background] Resuming summarization queue");
-
-  if (summarizationResumeResolve) {
-    summarizationResumeResolve();
-    summarizationResumeResolve = null;
-  }
-  summarizationResumePromise = null;
+  console.log("[Background] Resuming summarization (polling will pick up)");
 }
 
-// ==================== 摘要队列处理 ====================
+// ==================== 摘要队列处理（轮询） ====================
 
-async function processSummarizationQueue() {
-  if (isSummarizing || summarizationQueue.length === 0 || !engineReady) {
+/**
+ * 每次轮询处理一个摘要任务。
+ * 与 queuePageForSummarization / userQuery 完全解耦：
+ * - queuePageForSummarization 只负责入队
+ * - userQuery 只设置 userQueryPending 标志
+ * - 本函数由 setInterval 定时驱动，自行检查条件
+ */
+async function processSummarizationTick() {
+  // 任何一个条件不满足就跳过本轮
+  if (isSummarizing || userQueryPending || !engineReady || summarizationQueue.length === 0) {
     return;
   }
 
+  const url = summarizationQueue.shift()!;
   isSummarizing = true;
 
-  while (summarizationQueue.length > 0) {
-    const url = summarizationQueue.shift()!;
+  try {
     const pageData = await getPendingPage(url);
-
-    if (!pageData) {
-      continue;
-    }
+    if (!pageData) return;
 
     // 检查是否已有摘要
     const existingSummary = await getCachedSummary(url);
     if (existingSummary) {
       await removePendingPage(url);
-      continue;
+      return;
     }
 
-    try {
-      const response = await summarizePage(
-        pageData.url,
-        pageData.title,
-        pageData.content.substring(0, CONFIG.maxContentLength)
-      );
+    const response = await summarizePage(
+      pageData.url,
+      pageData.title,
+      pageData.content.substring(0, CONFIG.maxContentLength)
+    );
 
-      if (response.summary) {
-        await saveCachedSummary({
-          url: pageData.url,
-          title: pageData.title,
-          summary: response.summary,
-          timestamp: Date.now(),
-          contentLength: pageData.content.length
-        });
-        await removePendingPage(url);
-      }
-    } catch (err) {
-      console.error("[Background] Summarization failed:", err);
+    if (response.summary) {
+      await saveCachedSummary({
+        url: pageData.url,
+        title: pageData.title,
+        summary: response.summary,
+        timestamp: Date.now(),
+        contentLength: pageData.content.length
+      });
       await removePendingPage(url);
     }
-
-    // 每完成一个任务后检查：如果有用户提问等待，让出引擎
-    if (userQueryPending) {
-      console.log("[Background] Summarization yielding for user query");
-      if (summarizationYieldedResolve) {
-        summarizationYieldedResolve();
-        summarizationYieldedResolve = null;
-      }
-      if (summarizationResumePromise) {
-        await summarizationResumePromise;
-      }
-      console.log("[Background] Summarization resumed after user query");
-    }
+  } catch (err) {
+    console.error("[Background] Summarization failed:", err);
+    await removePendingPage(url);
+  } finally {
+    isSummarizing = false;
   }
-
-  isSummarizing = false;
 }
+
+// 每 2 秒轮询一次摘要队列
+setInterval(processSummarizationTick, 2000);
 
 async function queuePageForSummarization(url: string, title: string, content: string) {
   // 检查是否已有摘要
@@ -880,14 +854,11 @@ async function queuePageForSummarization(url: string, title: string, content: st
     timestamp: Date.now()
   });
 
-  // 加入队列
+  // 加入队列（轮询会自动消费）
   if (!summarizationQueue.includes(url)) {
     summarizationQueue.push(url);
+    console.log(`[Background] Queued for summarization: ${url} (queue size: ${summarizationQueue.length})`);
   }
-
-  // 确保 offscreen 已创建并开始处理
-  await ensureOffscreenDocument();
-  processSummarizationQueue();
 }
 
 // ==================== 消息监听器 ====================
@@ -966,14 +937,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       saveModelIdToStorage(newModelId).catch(err =>
         console.error("[Background] Failed to save model ID:", err)
       );
-
-      // 立即返回响应，让 popup 可以开始轮询进度
-      sendResponse({ success: true, status: "loading", modelId: newModelId });
-
       // 异步重新加载模型（状态由 initializeEngine 内部集中管理）
       initializeEngine(newModelId).catch(err =>
         console.error("[Background] Model reload failed:", err)
       );
+      // 立即返回响应，让 popup 可以开始轮询进度
+      sendResponse({ success: true, status: "loading", modelId: newModelId });      
       return true;
     }
 
@@ -1105,9 +1074,6 @@ chrome.runtime.onConnect.addListener((port) => {
           const { userMessage, useContext } = message;
 
           // 先收集标签页内容（不需要 LLM 引擎，可在摘要运行时并行执行）
-          // 必须在 pauseSummarizationForUserQuery 之前调用，
-          // 否则 await 内部 Promise 会打断 service worker 事件上下文，
-          // 导致 chrome.tabs.query 返回空数组。
           let tabContents: TabContentInfo[] = [];
           if (useContext) {
             tabContents = await fetchAllTabContents();
