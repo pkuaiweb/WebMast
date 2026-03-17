@@ -45,11 +45,41 @@ interface EngineInitResult {
   error?: string;
 }
 
+interface ChatMessage {
+  role: string;
+  content: string;
+}
+
+interface SummaryMap {
+  [url: string]: SummaryData;
+}
+
+interface SummaryEvaluationResult {
+  sufficient: boolean;
+  answer: string;
+}
+
+interface TabCompressedInfo {
+  index: number;
+  title: string;
+  url: string;
+  compressed: string;
+}
+
+interface TabMetaInfo {
+  index: number;
+  title: string;
+}
+
+interface SummarizePageResult {
+  summary: string;
+}
+
 // ==================== 常量配置 ====================
 
 const SUMMARY_CACHE_PREFIX = "page_summary_";
 const PENDING_CACHE_PREFIX = "pending_page_";
-const DEFAULT_MODEL_ID = "Qwen3-1.7B-q4f16_1-MLC" // "Phi-3.5-mini-instruct-q4f16_1-MLC"// "Llama-3.2-1B-Instruct-q4f16_1-MLC"// "Llama-3.2-3B-Instruct-q4f32_1-MLC";
+const DEFAULT_MODEL_ID = "Qwen3-0.6B-q4f16_1-MLC" // "Phi-3.5-mini-instruct-q4f16_1-MLC"// "Llama-3.2-1B-Instruct-q4f16_1-MLC"// "Llama-3.2-3B-Instruct-q4f32_1-MLC";
 const MODEL_STORAGE_KEY = "selected_model_id";
 const USE_SUMMARY_CACHE = true; // 是否启用摘要缓存
 const DATA_FLOW_TYPE: number = 1; // 1: 直接拼接，2: content提取，3: summary提取，4: summary评估+回退，5: 子问题+content，6: 子问题+summary评估+回退
@@ -198,9 +228,9 @@ async function saveCachedSummary(data: SummaryData): Promise<void> {
   await chrome.storage.local.set({ [cacheKey]: data });
 }
 
-async function getAllCachedSummaries(): Promise<{ [url: string]: SummaryData }> {
+async function getAllCachedSummaries(): Promise<SummaryMap> {
   const allData = await chrome.storage.local.get(null);
-  const summaries: { [url: string]: SummaryData } = {};
+  const summaries: SummaryMap = {};
 
   for (const key of Object.keys(allData)) {
     if (key.startsWith(SUMMARY_CACHE_PREFIX)) {
@@ -282,14 +312,14 @@ interface TabContentInfo {
 
 interface MultiTabQueryResult {
   success: boolean;
-  finalMessages?: Array<{ role: string; content: string }>;
+  finalMessages?: ChatMessage[];
   error?: string;
 }
 
 // 解析摘要响应 - 两种情况：
 // 1. sufficient:yes + answer -> 摘要足够，直接使用答案
 // 2. sufficient:no          -> 摘要信息不足，回退到原始内容
-function parseSummaryResponse(response: string): { sufficient: boolean; answer: string } {
+function parseSummaryResponse(response: string): SummaryEvaluationResult {
   console.log("[Background] Parsing summary response:", response);
   const normalized = response.toLowerCase();
 
@@ -316,7 +346,7 @@ function parseSummaryResponse(response: string): { sufficient: boolean; answer: 
 }
 
 // 如果模型是 Qwen3，在最后一条 user 消息末尾追加 /nothink
-function appendNothinkIfQwen3(messages: Array<{ role: string; content: string }>): Array<{ role: string; content: string }> {
+function appendNothinkIfQwen3(messages: ChatMessage[]): ChatMessage[] {
   if (!currentModelId.toLowerCase().includes("qwen3")) return messages;
   const result = messages.map(m => ({ ...m }));
   for (let i = result.length - 1; i >= 0; i--) {
@@ -332,7 +362,7 @@ function appendNothinkIfQwen3(messages: Array<{ role: string; content: string }>
 // 调用 offscreen 进行静默 chat（中间处理，不更新 UI）
 // activeRequests: 可选，传入端口关联的请求集合，用于 disconnect 时取消
 async function silentChat(
-  messages: Array<{ role: string; content: string }>,
+  messages: ChatMessage[],
   port: chrome.runtime.Port | null = null,
 ): Promise<string> {
   messages = appendNothinkIfQwen3(messages);
@@ -376,7 +406,7 @@ function buildExtractFromContentPrompt(
   content: string,
   question: string,
   index: number
-): Array<{ role: string; content: string }> {
+): ChatMessage[] {
   return [
     {
       role: "system",
@@ -405,7 +435,7 @@ function buildExtractFromContentPrompt(
 function buildSingleTabPrompt(
   pageContext: string,
   userMessage: string
-): Array<{ role: string; content: string }> {
+): ChatMessage[] {
   return [
     {
       role: "system",
@@ -419,7 +449,7 @@ function buildSingleTabPrompt(
 function buildSummaryEvaluationPrompt(
   cachedSummary: string,
   userMessage: string
-): Array<{ role: string; content: string }> {
+): ChatMessage[] {
   return [
     {
       role: "system",
@@ -450,10 +480,10 @@ function buildSummaryEvaluationPrompt(
 
 // Prompt: 多标签页合并结果后的最终问答
 function buildMultiTabFinalPrompt(
-  tabs: Array<{ index: number; title: string; url: string; compressed: string }>,
+  tabs: TabCompressedInfo[],
   totalTabCount: number,
   userMessage: string
-): Array<{ role: string; content: string }> {
+): ChatMessage[] {
   const combinedContext = tabs
     .map((tabInfo) =>
       `### Tab ${tabInfo.index}: ${tabInfo.title}\n${tabInfo.compressed}\n`
@@ -463,7 +493,7 @@ function buildMultiTabFinalPrompt(
   return [
     {
       role: "system",
-      content: `You are a helpful assistant. Below is the extracted information from ${tabs.length} tabs:\n\n${combinedContext.substring(0, CONFIG.maxContentLength*2)}\n\n`
+      content: `You are a helpful assistant. Below is the extracted information from ${tabs.length} tabs:\n\n${combinedContext}\n\n`
         + `Instructions:\n`
         + `- Answer the question strictly based on the information from the tabs above.\n`
         + `- When the question references information across multiple tabs, you MUST cross-reference: look up the value from one tab and match/compare it against the data from the other tab.\n`
@@ -478,7 +508,7 @@ function buildMultiTabFinalPrompt(
 function buildSummarizePagePrompt(
   title: string,
   content: string
-): Array<{ role: string; content: string }> {
+): ChatMessage[] {
   return [
     {
       role: "system",
@@ -502,9 +532,9 @@ function buildSummarizePagePrompt(
 
 // Prompt: 根据用户问题为每个标签页生成子问题
 function buildSubQuestionGenerationPrompt(
-  tabs: Array<{ index: number; title: string }>,
+  tabs: TabMetaInfo[],
   userMessage: string
-): Array<{ role: string; content: string }> {
+): ChatMessage[] {
   const tabList = tabs.map(t => `- Tab ${t.index}: ${t.title}`).join("\n");
   return [
     {
@@ -618,12 +648,7 @@ async function processMultiTabQuery(
   }
 
   // ---------- Phase 1: 逐标签页压缩 ----------
-  const compressedTabContents: {
-    index: number;
-    title: string;
-    url: string;
-    compressed: string;
-  }[] = [];
+  const compressedTabContents: TabCompressedInfo[] = [];
 
   for (let i = 0; i < allTabContents.length; i++) {
     const tabInfo = allTabContents[i];
@@ -745,7 +770,7 @@ async function summarizePage(
   url: string,
   title: string,
   content: string
-): Promise<{ summary: string }> {
+): Promise<SummarizePageResult> {
   console.log("[Background] Summarizing page:", title);
 
   const messages = buildSummarizePagePrompt(title, content);
@@ -755,7 +780,7 @@ async function summarizePage(
   return { summary };
 }
 
-// ==================== 用户提问优先级控制 ====================
+// ==================== 用户提问抢占 ====================
 
 /**
  * 标记用户提问开始，阻止摘要轮询启动新任务。
@@ -1009,7 +1034,7 @@ async function ensureEngineReadyForPort(port: chrome.runtime.Port): Promise<bool
  * 启动流式生成，返回的 Promise 在流式生成完成（done / error）时 resolve。
  * 这确保调用方可以 await 等待引擎空闲后再恢复摘要队列。
  */
-async function startStreaming(port: chrome.runtime.Port, messages: any[]): Promise<void> {
+async function startStreaming(port: chrome.runtime.Port, messages: ChatMessage[]): Promise<void> {
   // if (!await ensureEngineReadyForPort(port)) return;
   messages = appendNothinkIfQwen3(messages);
 

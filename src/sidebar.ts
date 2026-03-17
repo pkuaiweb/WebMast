@@ -31,6 +31,12 @@ interface StreamChunk {
   usage?: any;
 }
 
+interface EngineStatus {
+  ready: boolean;
+  progress: number;
+  modelId?: string;
+}
+
 // ==================== 配置 ====================
 
 const useContext = true;
@@ -249,7 +255,7 @@ saveSettingsButton.addEventListener("click", saveSettings);
 
 // ==================== 引擎状态管理 ====================
 
-async function checkEngineStatus(): Promise<{ ready: boolean; progress: number; modelId?: string }> {
+async function checkEngineStatus(): Promise<EngineStatus> {
   return new Promise((resolve) => {
     chrome.runtime.sendMessage({ type: "GET_ENGINE_STATUS" }, (response) => {
       if (chrome.runtime.lastError) {

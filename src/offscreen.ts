@@ -21,8 +21,27 @@ let isEngineInitializing = false;
 let engineReady = false;
 let currentModelId = "";
 
+interface ActiveRequestState {
+  aborted: boolean;
+}
+
+interface InitProgressReport {
+  progress: number;
+  text: string;
+}
+
+interface OffscreenEngineInitResult {
+  status: "ready" | "initializing" | "error";
+  error?: string;
+}
+
+interface ChatCompletionResult {
+  content: string;
+  usage?: any;
+}
+
 // 请求管理（用于取消）
-const activeRequests = new Map<string, { aborted: boolean }>();
+const activeRequests = new Map<string, ActiveRequestState>();
 
 // ==================== 抗复读配置 ====================
 
@@ -51,7 +70,7 @@ const MILD_REPEAT_CONFIG = {
   top_p: 0.9,
 };
 
-const initProgressCallback = (report: { progress: number; text: string }) => {
+const initProgressCallback = (report: InitProgressReport) => {
   const progress = report.progress;
   console.log("[Offscreen] Engine init progress:", Math.round(progress * 100) + "%", "-", report.text);
   chrome.runtime.sendMessage({
@@ -104,7 +123,7 @@ class RepetitionDetector {
 
 // ==================== 引擎初始化 ====================
 
-async function initializeEngine(modelId: string) {
+async function initializeEngine(modelId: string): Promise<OffscreenEngineInitResult> {
   // If same model is already initialized, return ready
   if (currentModelId === modelId && engineReady) {
     console.log("[Offscreen] Engine already initialized with model:", modelId);
@@ -120,8 +139,6 @@ async function initializeEngine(modelId: string) {
   engineReady = false;
   isEngineInitializing = true;
   currentModelId = modelId;
-
-
 
   try {
     if (engine) {
@@ -187,7 +204,7 @@ async function generateCore(
   messages: ChatCompletionMessageParam[],
   callbacks: GenerateCallbacks,
   extraCreateParams: Record<string, any> = {},
-): Promise<{ content: string; usage?: any }> {
+): Promise<ChatCompletionResult> {
   if (!engine || !engineReady) {
     throw new Error("Engine not ready");
   }
@@ -243,7 +260,7 @@ async function generateCore(
 async function chatCompletion(
   requestId: string,
   messages: ChatCompletionMessageParam[]
-): Promise<{ content: string; usage?: any }> {
+): Promise<ChatCompletionResult> {
   return generateCore(requestId, messages, {
     onChunk: () => { },                       // 不需要逐 chunk 处理
     onDone: () => { },                        // 由返回值传递结果
