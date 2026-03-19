@@ -3,7 +3,7 @@ WebMast Extension Automated Testing Script
 ============================================
 自动化测试 WebMast 浏览器扩展：
 1. 启动 Edge 浏览器（加载 WebMast 扩展）
-2. 对 v5.json 中每个任务，依次打开 open_url 中的网站
+2. 对 v6.json 中每个任务，依次打开 open_url 中的网站
 3. 等待网站加载完毕，打开 WebMast 扩展侧边栏
 4. 在 WebMast 输入框输入 intent，等待回复，记录 answer 和 TTFT
 5. 每个任务重复 3 次
@@ -12,7 +12,7 @@ WebMast Extension Automated Testing Script
 使用方式:
     pip install playwright
     playwright install chromium
-    python scripts/run_v5_test.py
+    python scripts/run_v6_test.py
 
 注意：
     - 首次运行时 WebMast 需要下载模型，可能需要几分钟
@@ -36,7 +36,7 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 PROJECT_DIR = SCRIPT_DIR.parent  # WebMast/
 
 EXTENSION_PATH = str(PROJECT_DIR / "dist")
-V5_JSON_PATH = str(PROJECT_DIR.parent / "正文" / "data" / "v5.json")
+JSON_PATH = str(PROJECT_DIR.parent / "正文" / "data" / "v6.json")
 OUTPUT_DIR = str(PROJECT_DIR.parent / "正文" / "data")
 USER_DATA_DIR = str(PROJECT_DIR / "test-profile")
 
@@ -281,7 +281,7 @@ async def handle_login_if_needed(context):
 
 async def main():
     # 加载任务数据
-    with open(V5_JSON_PATH, "r", encoding="utf-8") as f:
+    with open(JSON_PATH, "r", encoding="utf-8") as f:
         tasks = json.load(f)
     print(f"已加载 {len(tasks)} 个任务")
 
@@ -289,7 +289,7 @@ async def main():
     bg_constants = parse_background_constants()
     model_short = bg_constants["model_id"]  # e.g. "Qwen3"
     wf_type = bg_constants["workflow_type"]
-    OUTPUT_PATH = os.path.join(OUTPUT_DIR, f"v5_results_{model_short}_wf{wf_type}_headless_arm.json")
+    OUTPUT_PATH = os.path.join(OUTPUT_DIR, f"v6_{model_short}_wf{wf_type}_headless_arm.json")
     print(f"Model ID: {bg_constants['model_id']}, Workflow Type: {wf_type}")
     print(f"输出文件: {OUTPUT_PATH}")
 
