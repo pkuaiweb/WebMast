@@ -3,7 +3,7 @@ WebMast Extension Automated Testing Script
 ============================================
 自动化测试 WebMast 浏览器扩展：
 1. 启动 Edge 浏览器（加载 WebMast 扩展）
-2. 对 v6.json 中每个任务，依次打开 open_url 中的网站
+2. 对 v7.json 中每个任务，依次打开 open_url 中的网站
 3. 等待网站加载完毕，打开 WebMast 扩展侧边栏
 4. 在 WebMast 输入框输入 intent，等待回复，记录 answer 和 TTFT
 5. 每个任务重复 3 次
@@ -12,7 +12,7 @@ WebMast Extension Automated Testing Script
 使用方式:
     pip install playwright
     playwright install chromium
-    python scripts/run_v6_test.py
+    python scripts/run_v7_test.py
 
 注意：
     - 首次运行时 WebMast 需要下载模型，可能需要几分钟
@@ -36,18 +36,56 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 PROJECT_DIR = SCRIPT_DIR.parent  # WebMast/
 
 EXTENSION_PATH = str(PROJECT_DIR / "dist")
-JSON_PATH = str(PROJECT_DIR.parent / "正文" / "data" / "v6.json")
+JSON_PATH = str(PROJECT_DIR.parent / "正文" / "data" / "v7.json")
 OUTPUT_DIR = str(PROJECT_DIR.parent / "正文" / "data")
 USER_DATA_DIR = str(PROJECT_DIR / "test-profile")
 
 REPEAT_COUNT = 3                  # 每个任务重复次数
 PAGE_LOAD_TIMEOUT = 60000         # 页面加载超时 (ms)
 ENGINE_READY_TIMEOUT = 1200000     # 引擎加载超时 (ms), 首次下载模型较慢
-ANSWER_TIMEOUT = 90              # 等待回答超时 (秒)
+ANSWER_TIMEOUT = 300              # 等待回答超时 (秒)
 ANSWER_STABLE_SECONDS = 5         # 回答内容稳定多少秒视为完成
 WAIT_AFTER_PAGE_LOAD = 8          # 页面加载后等待 content script 注入的秒数
 NEED_LOGIN = False                 # 是否需要登录（首次运行时暂停让用户手动登录）
 BACKGROUND_TS_PATH = str(PROJECT_DIR / "src" / "background.ts")
+
+
+def clear_browser_startup_data(user_data_dir: str):
+    """统一清理会话恢复数据和扩展相关缓存。"""
+    default_dir = os.path.join(user_data_dir, "Default")
+
+    session_paths = [
+        os.path.join(default_dir, "Sessions"),
+        os.path.join(default_dir, "Current Session"),
+        os.path.join(default_dir, "Current Tabs"),
+        os.path.join(default_dir, "Last Session"),
+        os.path.join(default_dir, "Last Tabs"),
+    ]
+
+    sw_cache_paths = [
+        os.path.join(default_dir, "Service Worker", "Database"),
+        os.path.join(default_dir, "Service Worker", "ScriptCache"),
+        os.path.join(default_dir, "Extension State"),
+        os.path.join(default_dir, "Extension Rules"),
+        os.path.join(default_dir, "Extension Scripts"),
+        os.path.join(default_dir, "Code Cache"),
+    ]
+
+    for path in session_paths:
+        if os.path.isdir(path):
+            print(f"  清理会话目录: {os.path.relpath(path, user_data_dir)}/")
+            shutil.rmtree(path, ignore_errors=True)
+        elif os.path.isfile(path):
+            print(f"  清理会话文件: {os.path.relpath(path, user_data_dir)}")
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+
+    for path in sw_cache_paths:
+        if os.path.isdir(path):
+            print(f"  清除缓存: {os.path.relpath(path, user_data_dir)}/")
+            shutil.rmtree(path, ignore_errors=True)
 
 
 def parse_background_constants() -> dict:
@@ -289,7 +327,7 @@ async def main():
     bg_constants = parse_background_constants()
     model_short = bg_constants["model_id"]  # e.g. "Qwen3"
     wf_type = bg_constants["workflow_type"]
-    OUTPUT_PATH = os.path.join(OUTPUT_DIR, f"v6_{model_short}_wf{wf_type}_headless_arm.json")
+    OUTPUT_PATH = os.path.join(OUTPUT_DIR, f"v7_{model_short}_wf{wf_type}_headless_arm.json")
     print(f"Model ID: {bg_constants['model_id']}, Workflow Type: {wf_type}")
     print(f"输出文件: {OUTPUT_PATH}")
 
@@ -321,24 +359,9 @@ async def main():
         print("\n启动 Edge 浏览器...")
         os.makedirs(USER_DATA_DIR, exist_ok=True)
 
-        # 清除旧的扩展缓存，防止 rebuild 后旧 SW 残留导致新 SW 无法注册
-        # 注意：保留 Service Worker/CacheStorage/（WebLLM 模型权重缓存在这里）
-        sw_dir = os.path.join(USER_DATA_DIR, "Default", "Service Worker")
-        for sw_sub in ["Database", "ScriptCache"]:
-            path = os.path.join(sw_dir, sw_sub)
-            if os.path.isdir(path):
-                print(f"  清除缓存: Service Worker/{sw_sub}/")
-                shutil.rmtree(path, ignore_errors=True)
-
-        for subdir in [
-            os.path.join(USER_DATA_DIR, "Default", "Extension State"),
-            os.path.join(USER_DATA_DIR, "Default", "Extension Rules"),
-            os.path.join(USER_DATA_DIR, "Default", "Extension Scripts"),
-            os.path.join(USER_DATA_DIR, "Default", "Code Cache"),
-        ]:
-            if os.path.isdir(subdir):
-                print(f"  清除缓存: {os.path.basename(subdir)}/")
-                shutil.rmtree(subdir, ignore_errors=True)
+        # 统一清理会话恢复数据和扩展缓存，防止旧会话/旧 SW 残留影响测试
+        # 注意：保留 CacheStorage（WebLLM 模型权重缓存在这里）
+        clear_browser_startup_data(USER_DATA_DIR)
 
         context = await p.chromium.launch_persistent_context(
             user_data_dir=USER_DATA_DIR,

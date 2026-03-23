@@ -13,6 +13,15 @@ import buildInfo from "./build-info.json";
  */
 
 console.log(`[Background] Service worker starting... (build: ${buildInfo.uid} @ ${buildInfo.timestamp})`);
+// ==================== 常量配置 ====================
+
+const SUMMARY_CACHE_PREFIX = "page_summary_";
+const PENDING_CACHE_PREFIX = "pending_page_";
+const DEFAULT_MODEL_ID = "Qwen3-4B-q4f16_1-MLC" // "Phi-3.5-mini-instruct-q4f16_1-MLC"// "Llama-3.2-1B-Instruct-q4f16_1-MLC"// "Llama-3.2-3B-Instruct-q4f32_1-MLC";
+const MODEL_STORAGE_KEY = "selected_model_id";
+const USE_SUMMARY_CACHE = true; // 是否启用摘要缓存
+const DATA_FLOW_TYPE: number = 5; // 1: 直接拼接，2: content提取，3: summary提取，4: summary评估+回退，5: 子问题+content，6: 子问题+summary评估+回退
+let currentModelId = DEFAULT_MODEL_ID;
 
 // ==================== 类型定义 ====================
 
@@ -75,15 +84,6 @@ interface SummarizePageResult {
   summary: string;
 }
 
-// ==================== 常量配置 ====================
-
-const SUMMARY_CACHE_PREFIX = "page_summary_";
-const PENDING_CACHE_PREFIX = "pending_page_";
-const DEFAULT_MODEL_ID = "Qwen3-0.6B-q4f16_1-MLC" // "Phi-3.5-mini-instruct-q4f16_1-MLC"// "Llama-3.2-1B-Instruct-q4f16_1-MLC"// "Llama-3.2-3B-Instruct-q4f32_1-MLC";
-const MODEL_STORAGE_KEY = "selected_model_id";
-const USE_SUMMARY_CACHE = true; // 是否启用摘要缓存
-const DATA_FLOW_TYPE: number = 1; // 1: 直接拼接，2: content提取，3: summary提取，4: summary评估+回退，5: 子问题+content，6: 子问题+summary评估+回退
-let currentModelId = DEFAULT_MODEL_ID;
 
 // Load model ID from storage
 async function loadModelIdFromStorage(): Promise<string> {

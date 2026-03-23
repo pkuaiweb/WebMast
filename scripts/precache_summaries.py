@@ -43,7 +43,7 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 PROJECT_DIR = SCRIPT_DIR.parent  # WebMast/
 
 EXTENSION_PATH = str(PROJECT_DIR / "dist")
-V5_JSON_PATH = str(PROJECT_DIR.parent / "正文" / "data" / "v5.json")
+V5_JSON_PATH = str(PROJECT_DIR.parent / "正文" / "data" / "v6.json")
 SUMMARY_CACHE_JSON_PATH = str(PROJECT_DIR.parent / "正文" / "data" / "summary_cache.json")
 USER_DATA_DIR = str(PROJECT_DIR / "test-profile")
 BACKGROUND_TS_PATH = str(PROJECT_DIR / "src" / "background.ts")
@@ -54,6 +54,44 @@ SUMMARY_TIMEOUT = 180              # 等待单个摘要生成超时 (秒)
 WAIT_AFTER_PAGE_LOAD = 10          # 页面加载后等待 content script 注入 + PAGE_LOADED 发送的秒数
 SUMMARY_CACHE_PREFIX = "page_summary_"
 NEED_LOGIN = False
+
+
+def clear_browser_startup_data(user_data_dir: str):
+    """统一清理会话恢复数据和扩展相关缓存。"""
+    default_dir = os.path.join(user_data_dir, "Default")
+
+    session_paths = [
+        os.path.join(default_dir, "Sessions"),
+        os.path.join(default_dir, "Current Session"),
+        os.path.join(default_dir, "Current Tabs"),
+        os.path.join(default_dir, "Last Session"),
+        os.path.join(default_dir, "Last Tabs"),
+    ]
+
+    sw_cache_paths = [
+        os.path.join(default_dir, "Service Worker", "Database"),
+        os.path.join(default_dir, "Service Worker", "ScriptCache"),
+        os.path.join(default_dir, "Extension State"),
+        os.path.join(default_dir, "Extension Rules"),
+        os.path.join(default_dir, "Extension Scripts"),
+        os.path.join(default_dir, "Code Cache"),
+    ]
+
+    for path in session_paths:
+        if os.path.isdir(path):
+            print(f"  清理会话目录: {os.path.relpath(path, user_data_dir)}/")
+            shutil.rmtree(path, ignore_errors=True)
+        elif os.path.isfile(path):
+            print(f"  清理会话文件: {os.path.relpath(path, user_data_dir)}")
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+
+    for path in sw_cache_paths:
+        if os.path.isdir(path):
+            print(f"  清除缓存: {os.path.relpath(path, user_data_dir)}/")
+            shutil.rmtree(path, ignore_errors=True)
 
 
 # ==================== 工具函数 ====================
@@ -262,30 +300,16 @@ async def main():
         print("\n启动 Edge 浏览器...")
         os.makedirs(USER_DATA_DIR, exist_ok=True)
 
-        # 清除旧的扩展缓存（与 run_v5_test.py 保持一致），保留 CacheStorage（模型权重）
-        sw_dir = os.path.join(USER_DATA_DIR, "Default", "Service Worker")
-        for sw_sub in ["Database", "ScriptCache"]:
-            path = os.path.join(sw_dir, sw_sub)
-            if os.path.isdir(path):
-                print(f"  清除缓存: Service Worker/{sw_sub}/")
-                shutil.rmtree(path, ignore_errors=True)
-
-        for subdir in [
-            os.path.join(USER_DATA_DIR, "Default", "Extension State"),
-            os.path.join(USER_DATA_DIR, "Default", "Extension Rules"),
-            os.path.join(USER_DATA_DIR, "Default", "Extension Scripts"),
-            os.path.join(USER_DATA_DIR, "Default", "Code Cache"),
-        ]:
-            if os.path.isdir(subdir):
-                print(f"  清除缓存: {os.path.basename(subdir)}/")
-                shutil.rmtree(subdir, ignore_errors=True)
+        # 统一清理会话恢复数据和扩展缓存，防止旧会话/旧 SW 残留影响预缓存
+        # 注意：保留 CacheStorage（WebLLM 模型权重缓存在这里）
+        clear_browser_startup_data(USER_DATA_DIR)
 
         context = await p.chromium.launch_persistent_context(
             user_data_dir=USER_DATA_DIR,
             channel="msedge",
             headless=False,
             args=[
-                "--headless=new",
+                # "--headless=new",
                 f"--disable-extensions-except={EXTENSION_PATH}",
                 f"--load-extension={EXTENSION_PATH}",
             ],
