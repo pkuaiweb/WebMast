@@ -43,7 +43,7 @@ USER_DATA_DIR = str(PROJECT_DIR / "test-profile")
 REPEAT_COUNT = 3                  # 每个任务重复次数
 PAGE_LOAD_TIMEOUT = 60000         # 页面加载超时 (ms)
 ENGINE_READY_TIMEOUT = 1200000     # 引擎加载超时 (ms), 首次下载模型较慢
-ANSWER_TIMEOUT = 300              # 等待回答超时 (秒)
+ANSWER_TIMEOUT = 120              # 等待回答超时 (秒)
 ANSWER_STABLE_SECONDS = 5         # 回答内容稳定多少秒视为完成
 WAIT_AFTER_PAGE_LOAD = 8          # 页面加载后等待 content script 注入的秒数
 NEED_LOGIN = False                 # 是否需要登录（首次运行时暂停让用户手动登录）
@@ -264,19 +264,26 @@ async def open_content_tabs(context, urls: list[str]) -> list:
     """
     依次打开 URL 标签页，返回页面列表。
     这些标签页在 sidebar 之前创建，确保 tab index 正确。
+    如果任何 URL 加载失败，抛出 RuntimeError。
     """
     pages = []
+    failed = []
     for url in urls:
         page = await context.new_page()
         try:
             await page.goto(url, timeout=PAGE_LOAD_TIMEOUT, wait_until="domcontentloaded")
             print(f"    已打开: {url[:80]}...")
         except Exception as e:
-            print(f"    页面加载警告 ({url[:60]}...): {type(e).__name__}")
+            print(f"    页面加载失败 ({url[:60]}...): {type(e).__name__}")
+            failed.append(url)
         pages.append(page)
 
     # 等待 content script 注入和页面处理
     await asyncio.sleep(WAIT_AFTER_PAGE_LOAD)
+
+    if failed:
+        raise RuntimeError(f"{len(failed)} 个 URL 加载失败: {[u[:60] for u in failed]}")
+
     return pages
 
 
@@ -425,8 +432,26 @@ async def main():
                 # 先关闭旧的内容标签页
                 await close_content_tabs(context, sidebar_page)
 
-                # 打开新内容标签页
-                content_pages = await open_content_tabs(context, open_urls)
+                # 打开新内容标签页（最多重试 3 次）
+                content_pages = None
+                for open_attempt in range(3):
+                    try:
+                        content_pages = await open_content_tabs(context, open_urls)
+                        if len(content_pages) != len(open_urls):
+                            raise RuntimeError(
+                                f"标签页数量不匹配: 期望 {len(open_urls)}，实际 {len(content_pages)}"
+                            )
+                        break  # 成功，退出重试循环
+                    except Exception as e:
+                        print(f"  打开标签页失败 (尝试 {open_attempt+1}/3): {e}")
+                        await close_content_tabs(context, sidebar_page)
+                        content_pages = None
+                        if open_attempt < 2:
+                            await asyncio.sleep(2)
+
+                if not content_pages or len(content_pages) != len(open_urls):
+                    print(f"  跳过任务 {task_id}：3 次重试后仍无法打开所有标签页")
+                    continue
 
                 # ---- 重复提交 3 次 ----
                 for run_idx in range(REPEAT_COUNT):
