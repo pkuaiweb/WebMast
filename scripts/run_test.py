@@ -267,7 +267,7 @@ async def open_content_tabs(context, urls: list[str]) -> list:
     如果任何 URL 加载失败，抛出 RuntimeError。
     """
     pages = []
-    failed = []
+
     for url in urls:
         page = await context.new_page()
         try:
@@ -275,14 +275,11 @@ async def open_content_tabs(context, urls: list[str]) -> list:
             print(f"    已打开: {url[:80]}...")
         except Exception as e:
             print(f"    页面加载失败 ({url[:60]}...): {type(e).__name__}")
-            failed.append(url)
+            raise RuntimeError(f"URL 加载失败: {url[:60]}...")
         pages.append(page)
 
     # 等待 content script 注入和页面处理
     await asyncio.sleep(WAIT_AFTER_PAGE_LOAD)
-
-    if failed:
-        raise RuntimeError(f"{len(failed)} 个 URL 加载失败: {[u[:60] for u in failed]}")
 
     return pages
 
