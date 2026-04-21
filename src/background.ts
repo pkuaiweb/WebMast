@@ -17,7 +17,7 @@ console.log(`[Background] Service worker starting... (build: ${buildInfo.uid} @ 
 
 const SUMMARY_CACHE_PREFIX = "page_summary_";
 const PENDING_CACHE_PREFIX = "pending_page_";
-const DEFAULT_MODEL_ID = "Qwen3-4B-q4f16_1-MLC" // "Phi-3.5-mini-instruct-q4f16_1-MLC"// "Llama-3.2-1B-Instruct-q4f16_1-MLC"// "Llama-3.2-3B-Instruct-q4f32_1-MLC";
+const DEFAULT_MODEL_ID = "Qwen3-8B-q4f16_1-MLC" // "Phi-3.5-mini-instruct-q4f16_1-MLC"// "Llama-3.2-1B-Instruct-q4f16_1-MLC"// "Llama-3.2-3B-Instruct-q4f32_1-MLC";
 const MODEL_STORAGE_KEY = "selected_model_id";
 const USE_SUMMARY_CACHE = true; // 是否启用摘要缓存
 const DATA_FLOW_TYPE: number = 5; // 1: 直接拼接，2: content提取，3: summary提取，4: summary评估+回退，5: 子问题+content，6: 子问题+summary评估+回退
@@ -78,6 +78,7 @@ interface TabCompressedInfo {
 interface TabMetaInfo {
   index: number;
   title: string;
+  url: string;
 }
 
 interface SummarizePageResult {
@@ -101,7 +102,7 @@ const CONFIG = {
   maxConcurrentRequests: 1,
   requestTimeout: 120000, // 2分钟超时
   maxRetries: 3,
-  maxContentLength: 8000,
+  maxContentLength: 6000,
   minContentLength: 100,
 };
 
@@ -405,28 +406,29 @@ async function silentChat(
 function buildExtractFromContentPrompt(
   content: string,
   question: string,
-  index: number
+  index: number,
+  title: string = "",
+  url: string = ""
 ): ChatMessage[] {
   return [
     {
       role: "system",
       content: [
-        `You are extracting information from the content of tab ${index}.`,
-        `Focus ONLY on the content provided below. Do NOT reference or speculate about other tabs.`,
+        "You extract information from a web page to answer a question.",
         "",
         "Rules:",
-        "- If the content contains ANY data related to the question (prices, names, quantities, dates, etc.), extract and present it as concise bullet points.",
-        "- ALWAYS include exact numbers (review counts, ratings, prices, quantities) in your extraction — these are critical for filtering.",
-        "- Even a single relevant data point (e.g. one product's price) counts as relevant — extract it.",
-        // "- Only say 'N/A' if the content is COMPLETELY unrelated to the question.",
-        // "- Do NOT say N/A just because this tab alone cannot fully answer the question.",
+        "- Use ONLY the provided content. Do NOT add information from your own knowledge.",
+        "- If the content contains ANY data related to the question (prices, names, quantities, dates, etc.), extract and present it as concise bullet points starting with \"-\".",
+        "- ALWAYS include exact numbers (review counts, ratings, prices, quantities) — these are critical for filtering.",
+        "- Even a single relevant data point counts as relevant — extract it.",
+        // "- If the content is COMPLETELY unrelated to the question, reply with exactly: N/A",
         "- Do NOT mention or refer to any other tabs. Only describe what is in THIS content.",
         "- No conversational filler."
       ].join("\n")
     },
     {
       role: "user",
-      content: `Content of tab ${index}:\n${content.substring(0, CONFIG.maxContentLength)}\n\nQUESTION: ${question}`
+      content: `Tab ${index}: ${title}\nURL: ${url}\n\n${content.substring(0, CONFIG.maxContentLength)}\n\nQUESTION: ${question}`
     }
   ];
 }
@@ -486,37 +488,48 @@ function buildMultiTabFinalPrompt(
 ): ChatMessage[] {
   const combinedContext = tabs
     .map((tabInfo) =>
-      `### Tab ${tabInfo.index}: ${tabInfo.title}\n${tabInfo.compressed}\n`
+      `### Tab ${tabInfo.index}: ${tabInfo.title}\nURL: ${tabInfo.url}\n${tabInfo.compressed}\n`
     )
     .join("\n");
 
   return [
     {
       role: "system",
-      content: `You are a helpful assistant. Below is the extracted information from ${tabs.length} tabs:\n\n${combinedContext}\n\n`
-        + `Instructions:\n`
-        + `- Answer the question strictly based on the information from the tabs above.\n`
-        + `- When the question references information across multiple tabs, you MUST cross-reference: look up the value from one tab and match/compare it against the data from the other tab.\n`
-        + `- Focus on what the user is actually asking — they may want to combine or compare specific attributes across tabs.\n`
-        + `- Be concise and NEVER repeat the same sentence, phrase, or point.`
+      content: [
+        "You are a helpful assistant that answers questions using ONLY the tab data provided by the user.",
+        "",
+        "Rules:",
+        "- Use ONLY the information from the provided tabs. Do NOT use your own knowledge or make assumptions beyond the data.",
+        "- When the question requires cross-referencing multiple tabs, look up values from one tab and compare against the other.",
+        "- If the provided tabs do not contain enough information to answer the question, say \"The provided tabs do not contain enough information to answer this question.\"",
+        "- Be concise. Do NOT repeat the same point.",
+      ].join("\n")
     },
-    { role: "user", content: `QUESTION: ${userMessage}` }
+    {
+      role: "user",
+      content: `Here is the extracted information from ${tabs.length} tabs:\n\n${combinedContext}\n\nQUESTION: ${userMessage}`
+    }
   ];
 }
 
 // Prompt: 页面摘要生成
 function buildSummarizePagePrompt(
   title: string,
+  url: string,
   content: string
 ): ChatMessage[] {
+  const truncated = content.substring(0, CONFIG.maxContentLength);
+  const charCount = truncated.length;
+  // bullet 数量与文本信息量成正比：短文本 3-5 条，中等 5-8 条，长文本 8-12 条
+  const bulletRange = charCount < 1500 ? "3–5" : charCount < 4000 ? "5–8" : "8–12";
   return [
     {
       role: "system",
       content: [
-        "You are a helpful assistant that summarizes web pages into concise bullet points.",
+        "You summarize web pages into concise bullet points.",
         "",
         "Rules:",
-        "- Produce concise bullet points covering the main topics, key facts, and important details.",
+        `- Produce ${bulletRange} bullet points covering the main topics, key facts, and important details.`,
         "- ALWAYS include exact numbers (prices, ratings, counts, dates, percentages, quantities) — these are critical.",
         "- Each bullet point must convey a distinct piece of information. Do NOT repeat the same point in different words.",
         "- Use short, factual statements. No conversational filler, no greetings, no meta-commentary.",
@@ -525,7 +538,7 @@ function buildSummarizePagePrompt(
     },
     {
       role: "user",
-      content: `Summarize this webpage:\n\nTitle: ${title}\n\nContent:\n${content.substring(0, CONFIG.maxContentLength)}`
+      content: `Summarize this webpage:\n\nTitle: ${title}\nURL: ${url}\n\nContent:\n${truncated}`
     }
   ];
 }
@@ -535,7 +548,7 @@ function buildSubQuestionGenerationPrompt(
   tabs: TabMetaInfo[],
   userMessage: string
 ): ChatMessage[] {
-  const tabList = tabs.map(t => `- Tab ${t.index}: ${t.title}`).join("\n");
+  const tabList = tabs.map(t => `- Tab ${t.index}: ${t.title} (${t.url})`).join("\n");
   return [
     {
       role: "system",
@@ -635,7 +648,7 @@ async function processMultiTabQuery(
   // ---------- 对于 DATA FLOW 5 / 6: 先生成子问题 ----------
   let subQuestions: Map<number, string> | null = null;
   if (DATA_FLOW_TYPE === 5 || DATA_FLOW_TYPE === 6) {
-    const tabMeta = allTabContents.map(t => ({ index: t.index, title: t.title }));
+    const tabMeta = allTabContents.map(t => ({ index: t.index, title: t.title, url: t.url }));
     const subQPrompt = buildSubQuestionGenerationPrompt(tabMeta, userMessage);
     try {
       const subQResponse = await silentChat(subQPrompt, port);
@@ -666,7 +679,7 @@ async function processMultiTabQuery(
       switch (DATA_FLOW_TYPE) {
         // --- DATA FLOW 2: 用 userMessage + content 提取 ---
         case 2: {
-          const msgs = buildExtractFromContentPrompt(tabInfo.content, userMessage, tabInfo.index);
+          const msgs = buildExtractFromContentPrompt(tabInfo.content, userMessage, tabInfo.index, tabInfo.title, tabInfo.url);
           compressedContent = await silentChat(msgs, port);
           console.log(`[Background] [WF2] extracted: ${compressedContent}`);
           break;
@@ -675,7 +688,7 @@ async function processMultiTabQuery(
         // --- DATA FLOW 3: 用 userMessage + cachedSummary 提取 ---
         case 3: {
           const source = tabInfo.cachedSummary || tabInfo.content;
-          const msgs = buildExtractFromContentPrompt(source, userMessage, tabInfo.index);
+          const msgs = buildExtractFromContentPrompt(source, userMessage, tabInfo.index, tabInfo.title, tabInfo.url);
           compressedContent = await silentChat(msgs, port);
           console.log(`[Background] [WF3] extracted (from ${tabInfo.cachedSummary ? "summary" : "content"}): ${compressedContent}`);
           break;
@@ -692,13 +705,13 @@ async function processMultiTabQuery(
               compressedContent = parsed.answer;
             } else {
               // 摘要不足，回退到 content
-              const fallback = buildExtractFromContentPrompt(tabInfo.content, userMessage, tabInfo.index);
+              const fallback = buildExtractFromContentPrompt(tabInfo.content, userMessage, tabInfo.index, tabInfo.title, tabInfo.url);
               compressedContent = await silentChat(fallback, port);
               console.log(`[Background] [WF4] Insufficient summary for: ${tabInfo.title}, extracted: ${compressedContent}`);
             }
           } else {
             // 无摘要，直接用 content
-            const msgs = buildExtractFromContentPrompt(tabInfo.content, userMessage, tabInfo.index);
+            const msgs = buildExtractFromContentPrompt(tabInfo.content, userMessage, tabInfo.index, tabInfo.title, tabInfo.url);
             compressedContent = await silentChat(msgs, port);
             console.log(`[Background] [WF4] No summary, extracted: ${compressedContent}`);
           }
@@ -707,7 +720,7 @@ async function processMultiTabQuery(
 
         // --- DATA FLOW 5: 子问题 + content 提取 ---
         case 5: {
-          const msgs = buildExtractFromContentPrompt(tabInfo.content, tabQuestion, tabInfo.index);
+          const msgs = buildExtractFromContentPrompt(tabInfo.content, tabQuestion, tabInfo.index, tabInfo.title, tabInfo.url);
           compressedContent = await silentChat(msgs, port);
           console.log(`[Background] [WF5] extracted: ${compressedContent}`);
           break;
@@ -723,12 +736,12 @@ async function processMultiTabQuery(
             if (parsed.sufficient) {
               compressedContent = parsed.answer;
             } else {
-              const fallback = buildExtractFromContentPrompt(tabInfo.content, tabQuestion, tabInfo.index);
+              const fallback = buildExtractFromContentPrompt(tabInfo.content, tabQuestion, tabInfo.index, tabInfo.title, tabInfo.url);
               compressedContent = await silentChat(fallback, port);
               console.log(`[Background] [WF6] Insufficient summary for: ${tabInfo.title}, extracted: ${compressedContent}`);
             }
           } else {
-            const msgs = buildExtractFromContentPrompt(tabInfo.content, tabQuestion, tabInfo.index);
+            const msgs = buildExtractFromContentPrompt(tabInfo.content, tabQuestion, tabInfo.index, tabInfo.title, tabInfo.url);
             compressedContent = await silentChat(msgs, port);
             console.log(`[Background] [WF6] No summary, extracted: ${compressedContent}`);
           }
@@ -737,7 +750,7 @@ async function processMultiTabQuery(
 
         default:
           console.warn(`[Background] Unknown DATA FLOW_TYPE: ${DATA_FLOW_TYPE}, falling back to WF2`);
-          const msgs = buildExtractFromContentPrompt(tabInfo.content, userMessage, tabInfo.index);
+          const msgs = buildExtractFromContentPrompt(tabInfo.content, userMessage, tabInfo.index, tabInfo.title, tabInfo.url);
           compressedContent = await silentChat(msgs, port);
           break;
       }
@@ -773,7 +786,7 @@ async function summarizePage(
 ): Promise<SummarizePageResult> {
   console.log("[Background] Summarizing page:", title);
 
-  const messages = buildSummarizePagePrompt(title, content);
+  const messages = buildSummarizePagePrompt(title, url, content);
 
   const summary = await silentChat(messages);
   console.log("[Background] Summary generated:", summary.length, "chars\n"+summary);

@@ -1,22 +1,28 @@
 """
-WebMast Extension Automated Testing Script
-============================================
-自动化测试 WebMast 浏览器扩展：
-1. 启动 Edge 浏览器（加载 WebMast 扩展）
-2. 对每个任务 JSON 中的任务，依次打开 open_url 中的网站
-3. 等待网站加载完毕，打开 WebMast 扩展侧边栏
-4. 在 WebMast 输入框输入 intent，等待回复，记录 answer 和 TTFT
+WebMast Extension Local-HTML Testing Script
+=============================================
+基于 run_test.py 改写，使用本地 HTML 文件（由 save_pages.py 生成）
+替代原始远程网页进行测试。
+
+工作流程：
+1. 启动本地 HTTP 服务器，提供 files/html/ 中的 HTML 文件
+2. 启动 Edge 浏览器（加载 WebMast 扩展）
+3. 对每个任务，打开 *本地* HTML 页面（内容与原始网页 innerText 一致）
+4. 在 WebMast 侧边栏输入 intent，等待回复，记录 answer 和 TTFT
 5. 每个任务重复 3 次
 6. 将所有运行结果记录到 JSON 文件中
+
+前置条件：
+    先运行 save_pages.py 生成本地 HTML 文件和 url_map.json
 
 使用方式:
     pip install playwright
     playwright install chromium
-    python scripts/run_test.py
+    python scripts/run_test_local.py
 
 注意：
+    - 需要先运行 save_pages.py 抓取网页内容
     - 首次运行时 WebMast 需要下载模型，可能需要几分钟
-    - 如果目标网站需要登录，首次运行会暂停让你手动登录
     - 使用持久化浏览器 profile，登录状态会被保留
 """
 
@@ -27,6 +33,9 @@ import re
 import os
 import sys
 import shutil
+import threading
+import http.server
+import functools
 from pathlib import Path
 from playwright.async_api import async_playwright
 
@@ -40,16 +49,31 @@ DATA_DIR = str(PROJECT_DIR.parent / "Master-Thesis" / "data")
 OUTPUT_DIR = str(PROJECT_DIR.parent / "Master-Thesis" / "data")
 USER_DATA_DIR = str(PROJECT_DIR / "test-profile")
 
+HTML_DIR = str(PROJECT_DIR / "files" / "html")
+URL_MAP_PATH = os.path.join(HTML_DIR, "url_map.json")
+LOCAL_SERVER_PORT = 8765          # 本地 HTTP 服务器端口
+
 TASK_JSON_FILES = ["gitlab.json", "map.json", "reddit.json",  "wiki.json"]
 
 REPEAT_COUNT = 3                  # 每个任务重复次数
 PAGE_LOAD_TIMEOUT = 60000         # 页面加载超时 (ms)
-ENGINE_READY_TIMEOUT = 1200000     # 引擎加载超时 (ms), 首次下载模型较慢
-ANSWER_TIMEOUT = 180              # 等待回答超时 (秒)
+ENGINE_READY_TIMEOUT = 1200000    # 引擎加载超时 (ms), 首次下载模型较慢
+ANSWER_TIMEOUT = 120              # 等待回答超时 (秒)
 ANSWER_STABLE_SECONDS = 5         # 回答内容稳定多少秒视为完成
-WAIT_AFTER_PAGE_LOAD = 8          # 页面加载后等待 content script 注入的秒数
-NEED_LOGIN = False                 # 是否需要登录（首次运行时暂停让用户手动登录）
+WAIT_AFTER_PAGE_LOAD = 3          # 页面加载后等待 content script 注入的秒数
 BACKGROUND_TS_PATH = str(PROJECT_DIR / "src" / "background.ts")
+
+
+# ==================== 本地 HTTP 服务器 ====================
+
+def start_local_server(directory: str, port: int) -> http.server.HTTPServer:
+    """在后台线程启动一个本地 HTTP 服务器，用于提供 HTML 文件"""
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=directory)
+    server = http.server.HTTPServer(("127.0.0.1", port), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"  本地 HTTP 服务器已启动: http://127.0.0.1:{port}/")
+    return server
 
 
 # ==================== 数据加载 ====================
@@ -70,6 +94,40 @@ def load_tasks_from_data_dir(data_dir: str) -> list[dict]:
     all_tasks.sort(key=lambda t: t.get("task_id", 0))
     return all_tasks
 
+
+def load_url_map(url_map_path: str) -> dict[str, str]:
+    """加载 URL → 本地文件名映射"""
+    if not os.path.exists(url_map_path):
+        raise FileNotFoundError(
+            f"URL 映射文件不存在: {url_map_path}\n"
+            "请先运行 save_pages.py 生成本地 HTML 文件。"
+        )
+    with open(url_map_path, "r", encoding="utf-8") as f:
+        url_map = json.load(f)
+    # 过滤掉失败的映射 (值为 None)
+    valid = {k: v for k, v in url_map.items() if v is not None}
+    print(f"  已加载 {len(valid)}/{len(url_map)} 个有效 URL 映射")
+    return valid
+
+
+def map_urls_to_local(
+    urls: list[str], url_map: dict[str, str], base_url: str
+) -> list[str] | None:
+    """
+    将原始 URL 列表映射为本地 URL 列表。
+    如果任何 URL 缺少映射，返回 None。
+    """
+    local_urls = []
+    for url in urls:
+        filename = url_map.get(url)
+        if not filename:
+            print(f"    缺少本地文件映射: {url[:80]}...")
+            return None
+        local_urls.append(f"{base_url}/{filename}")
+    return local_urls
+
+
+# ==================== 浏览器工具函数（与 run_test.py 相同） ====================
 
 def clear_browser_startup_data(user_data_dir: str):
     """统一清理会话恢复数据和扩展相关缓存。"""
@@ -128,7 +186,6 @@ def parse_background_constants() -> dict:
 
 async def get_extension_id(context) -> str:
     """从 service worker 或 background page 获取扩展 ID"""
-    # 轮询等待 service worker 注册（持久化 profile 下 SW 可能延迟激活）
     print("  等待扩展 service worker 注册...")
     for attempt in range(30):
         if context.service_workers:
@@ -136,7 +193,6 @@ async def get_extension_id(context) -> str:
             ext_id = sw.url.split("/")[2]
             print(f"  扩展 ID (service worker): {ext_id}")
             return ext_id
-        # MV2 fallback: 检查 background pages
         if context.background_pages:
             bg = context.background_pages[0]
             ext_id = bg.url.split("/")[2]
@@ -144,7 +200,6 @@ async def get_extension_id(context) -> str:
             return ext_id
         await asyncio.sleep(2)
 
-    # 最终fallback: 等待 serviceworker 事件
     print("  轮询未找到，等待 serviceworker 事件...")
     sw = await context.wait_for_event("serviceworker", timeout=30000)
     ext_id = sw.url.split("/")[2]
@@ -186,11 +241,8 @@ async def submit_query(sidebar_page, intent: str):
     await input_el.fill("")
     await input_el.fill(intent)
 
-    # fill() 不触发 keyup 事件，而 sidebar.ts 依赖 keyup 来启用 submit 按钮
-    # 手动 dispatch 一个 keyup 事件来启用按钮
     await input_el.dispatch_event("keyup")
 
-    # 等待 submit button 启用（state 参数不支持 "enabled"，用 wait_for_function）
     await sidebar_page.wait_for_function(
         """() => {
             const btn = document.getElementById('submit-button');
@@ -210,7 +262,6 @@ async def wait_for_answer(sidebar_page, timeout=ANSWER_TIMEOUT) -> tuple[str, st
     """
     start = time.time()
 
-    # Step 1: 等待 answer 区域出现内容（第一个 chunk 到达）
     try:
         await sidebar_page.wait_for_function(
             """() => {
@@ -221,18 +272,15 @@ async def wait_for_answer(sidebar_page, timeout=ANSWER_TIMEOUT) -> tuple[str, st
         )
     except Exception as e:
         print(f"    等待首个回答超时: {e}")
-        # 尝试获取当前内容
         answer = await sidebar_page.evaluate(
             "document.getElementById('answer')?.innerText || ''"
         )
         return (answer.strip() or "timeout", "N/A")
 
-    # Step 2: 获取 TTFT（此时 timer 已冻结）
     ttft_text = await sidebar_page.text_content("#elapsed-timer") or ""
     ttft_match = re.search(r"([\d.]+)\s*s", ttft_text)
     ttft = ttft_match.group(1) if ttft_match else "N/A"
 
-    # Step 3: 等待回答内容稳定（不再变化超过 ANSWER_STABLE_SECONDS 秒即视为完成）
     last_answer = ""
     stable_start = None
 
@@ -251,18 +299,16 @@ async def wait_for_answer(sidebar_page, timeout=ANSWER_TIMEOUT) -> tuple[str, st
             if stable_start is None:
                 stable_start = time.time()
             elif time.time() - stable_start >= ANSWER_STABLE_SECONDS:
-                break  # 内容已稳定
+                break
         else:
             stable_start = None
             last_answer = current
 
         await asyncio.sleep(0.5)
 
-    # 获取最终答案
     final_answer = await sidebar_page.evaluate(
         "document.getElementById('answer')?.innerText || ''"
     )
-    # 再次获取 TTFT（防止前面获取太早）
     ttft_text_final = await sidebar_page.text_content("#elapsed-timer") or ""
     ttft_match_final = re.search(r"([\d.]+)\s*s", ttft_text_final)
     if ttft_match_final:
@@ -284,7 +330,6 @@ async def close_content_tabs(context, sidebar_page):
 async def open_content_tabs(context, urls: list[str]) -> list:
     """
     依次打开 URL 标签页，返回页面列表。
-    这些标签页在 sidebar 之前创建，确保 tab index 正确。
     如果任何 URL 加载失败，抛出 RuntimeError。
     """
     pages = []
@@ -293,10 +338,10 @@ async def open_content_tabs(context, urls: list[str]) -> list:
         page = await context.new_page()
         try:
             await page.goto(url, timeout=PAGE_LOAD_TIMEOUT, wait_until="domcontentloaded")
-            print(f"    已打开: {url[:80]}...")
+            print(f"    已打开: {url[:100]}...")
         except Exception as e:
-            print(f"    页面加载失败 ({url[:60]}...): {type(e).__name__}")
-            raise RuntimeError(f"URL 加载失败: {url[:60]}...")
+            print(f"    页面加载失败 ({url[:80]}...): {type(e).__name__}")
+            raise RuntimeError(f"URL 加载失败: {url[:80]}...")
         pages.append(page)
 
     # 等待 content script 注入和页面处理
@@ -305,60 +350,34 @@ async def open_content_tabs(context, urls: list[str]) -> list:
     return pages
 
 
-async def handle_login_if_needed(context):
-    """首次运行时暂停让用户手动登录"""
-    if not NEED_LOGIN:
-        return
-
-    login_marker = os.path.join(USER_DATA_DIR, ".login_done")
-    if os.path.exists(login_marker):
-        print("  已检测到登录标记，跳过登录步骤")
-        return
-
-    # 打开登录页面
-    page = await context.new_page()
-    login_url = "http://ec2-18-118-167-74.us-east-2.compute.amazonaws.com:7770/customer/account/login/"
-    try:
-        await page.goto(login_url, timeout=PAGE_LOAD_TIMEOUT, wait_until="domcontentloaded")
-    except Exception:
-        print(f"  无法打开登录页面，可能网站不可达: {login_url}")
-        await page.close()
-        return
-
-    print("\n" + "=" * 60)
-    print("请在浏览器中手动登录网站")
-    print("登录完成后，回到终端按 Enter 继续...")
-    print("=" * 60)
-
-    # 等待用户按 Enter
-    await asyncio.get_event_loop().run_in_executor(None, input)
-
-    # 标记已登录
-    os.makedirs(USER_DATA_DIR, exist_ok=True)
-    with open(login_marker, "w") as f:
-        f.write("logged in")
-    print("  登录标记已保存")
-
-    await page.close()
-
+# ==================== 主流程 ====================
 
 async def main():
     # 加载任务数据（从各分类 JSON 文件合并）
     print("加载任务数据...")
     tasks = load_tasks_from_data_dir(DATA_DIR)
-    print(f"共加载 {len(tasks)} 个任务")
+    print(f"共加载 {len(tasks)} 个任务\n")
+
+    # 加载 URL 映射
+    print("加载 URL 映射...")
+    url_map = load_url_map(URL_MAP_PATH)
+    local_base_url = f"http://127.0.0.1:{LOCAL_SERVER_PORT}"
 
     # 解析 background.ts 中的常量
     bg_constants = parse_background_constants()
-    model_short = bg_constants["model_id"]  # e.g. "Qwen3"
+    model_short = bg_constants["model_id"]
     wf_type = bg_constants["workflow_type"]
-    OUTPUT_PATH = os.path.join(OUTPUT_DIR, f"remote_{model_short}_wf{wf_type}_headless_arm.json")
+    OUTPUT_PATH = os.path.join(OUTPUT_DIR, f"local_{model_short}_wf{wf_type}_headless.json")
     print(f"Model ID: {bg_constants['model_id']}, Workflow Type: {wf_type}")
     print(f"输出文件: {OUTPUT_PATH}")
 
     # 获取 sidebar 文件名
     sidebar_filename = get_sidebar_filename(EXTENSION_PATH)
     print(f"Sidebar 文件: {sidebar_filename}")
+
+    # 启动本地 HTTP 服务器
+    print("\n启动本地 HTTP 服务器...")
+    server = start_local_server(HTML_DIR, LOCAL_SERVER_PORT)
 
     # 如果有之前中断的结果，加载它
     existing_results = []
@@ -384,14 +403,12 @@ async def main():
         print("\n启动 Edge 浏览器...")
         os.makedirs(USER_DATA_DIR, exist_ok=True)
 
-        # 统一清理会话恢复数据和扩展缓存，防止旧会话/旧 SW 残留影响测试
-        # 注意：保留 CacheStorage（WebLLM 模型权重缓存在这里）
         clear_browser_startup_data(USER_DATA_DIR)
 
         context = await p.chromium.launch_persistent_context(
             user_data_dir=USER_DATA_DIR,
             channel="msedge",
-            headless=False,          # 保持 False，通过 --headless=new 启用新 headless 模式（支持扩展）
+            headless=False,
             args=[
                 # "--headless=new",
                 f"--disable-extensions-except={EXTENSION_PATH}",
@@ -405,9 +422,6 @@ async def main():
             # 获取扩展 ID
             ext_id = await get_extension_id(context)
             sidebar_url = f"chrome-extension://{ext_id}/{sidebar_filename}"
-
-            # 处理登录
-            await handle_login_if_needed(context)
 
             # 关闭默认页面
             for page in context.pages:
@@ -435,17 +449,23 @@ async def main():
                     print(f"\n[{task_idx+1}/{len(tasks)}] Task {task_id} 已完成，跳过")
                     continue
 
+                # 将原始 URL 映射为本地 URL
+                local_urls = map_urls_to_local(open_urls, url_map, local_base_url)
+                if local_urls is None:
+                    print(f"  跳过任务 {task_id}：部分 URL 缺少本地文件映射")
+                    continue
+
                 print(f"\n{'=' * 60}")
                 print(f"[{task_idx+1}/{len(tasks)}] Task ID: {task_id}")
                 print(f"  Intent: {intent}")
-                print(f"  URLs: {len(open_urls)} 个")
+                print(f"  URLs: {len(open_urls)} 个 (本地)")
 
                 task_result = {
                     "task_id": task_id,
                     "runs": [],
                 }
 
-                # ---- 打开所有内容标签页 ----
+                # ---- 打开所有内容标签页（使用本地 URL）----
 
                 # 先关闭旧的内容标签页
                 await close_content_tabs(context, sidebar_page)
@@ -454,12 +474,12 @@ async def main():
                 content_pages = None
                 for open_attempt in range(3):
                     try:
-                        content_pages = await open_content_tabs(context, open_urls)
-                        if len(content_pages) != len(open_urls):
+                        content_pages = await open_content_tabs(context, local_urls)
+                        if len(content_pages) != len(local_urls):
                             raise RuntimeError(
-                                f"标签页数量不匹配: 期望 {len(open_urls)}，实际 {len(content_pages)}"
+                                f"标签页数量不匹配: 期望 {len(local_urls)}，实际 {len(content_pages)}"
                             )
-                        break  # 成功，退出重试循环
+                        break
                     except Exception as e:
                         print(f"  打开标签页失败 (尝试 {open_attempt+1}/3): {e}")
                         await close_content_tabs(context, sidebar_page)
@@ -467,7 +487,7 @@ async def main():
                         if open_attempt < 2:
                             await asyncio.sleep(2)
 
-                if not content_pages or len(content_pages) != len(open_urls):
+                if not content_pages or len(content_pages) != len(local_urls):
                     print(f"  跳过任务 {task_id}：3 次重试后仍无法打开所有标签页")
                     continue
 
@@ -477,7 +497,7 @@ async def main():
 
                     # 每次 run 都关闭并重新打开 sidebar，确保状态干净
                     try:
-                        await asyncio.sleep(2)  # 等待可能的后台处理完成
+                        await asyncio.sleep(2)
                         await sidebar_page.close()
                         await asyncio.sleep(1)
                     except Exception:
@@ -513,7 +533,6 @@ async def main():
                     print(f"    TTFT: {ttft}s")
                     print(f"    Answer: {answer_preview}")
 
-
                 results.append(task_result)
 
                 # 每完成一个任务就保存中间结果（防止中断丢失）
@@ -533,7 +552,6 @@ async def main():
             print(f"已保存 {len(results)} 个任务的结果到 {OUTPUT_PATH}")
         except Exception as e:
             print(f"\n错误: {e}")
-            # 保存已有结果
             if results:
                 with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
                     json.dump(results, f, indent=2, ensure_ascii=False)
@@ -541,6 +559,8 @@ async def main():
             raise
         finally:
             await context.close()
+            server.shutdown()
+            print("  本地 HTTP 服务器已关闭")
 
 
 if __name__ == "__main__":

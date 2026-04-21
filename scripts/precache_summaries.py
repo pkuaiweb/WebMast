@@ -34,6 +34,9 @@ import os
 import re
 import shutil
 import time
+import threading
+import http.server
+import functools
 from pathlib import Path
 from playwright.async_api import async_playwright
 
@@ -43,10 +46,12 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 PROJECT_DIR = SCRIPT_DIR.parent  # WebMast/
 
 EXTENSION_PATH = str(PROJECT_DIR / "dist")
-V5_JSON_PATH = str(PROJECT_DIR.parent / "正文" / "data" / "v6.json")
-SUMMARY_CACHE_JSON_PATH = str(PROJECT_DIR.parent / "正文" / "data" / "summary_cache.json")
+SUMMARY_CACHE_JSON_PATH = str(PROJECT_DIR  / "files" / "summary_cache.json")
 USER_DATA_DIR = str(PROJECT_DIR / "test-profile")
 BACKGROUND_TS_PATH = str(PROJECT_DIR / "src" / "background.ts")
+
+HTML_DIR = str(PROJECT_DIR / "files" / "html")
+LOCAL_SERVER_PORT = 8765          # 本地 HTTP 服务器端口
 
 PAGE_LOAD_TIMEOUT = 60000          # 页面加载超时 (ms)
 ENGINE_READY_TIMEOUT = 1200000     # 引擎加载超时 (ms), 首次下载模型较慢
@@ -54,6 +59,28 @@ SUMMARY_TIMEOUT = 180              # 等待单个摘要生成超时 (秒)
 WAIT_AFTER_PAGE_LOAD = 10          # 页面加载后等待 content script 注入 + PAGE_LOADED 发送的秒数
 SUMMARY_CACHE_PREFIX = "page_summary_"
 NEED_LOGIN = False
+
+
+# ==================== 本地 HTTP 服务器 ====================
+
+def start_local_server(directory: str, port: int) -> http.server.HTTPServer:
+    """在后台线程启动一个本地 HTTP 服务器，用于提供 HTML 文件"""
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=directory)
+    server = http.server.HTTPServer(("127.0.0.1", port), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"  本地 HTTP 服务器已启动: http://127.0.0.1:{port}/")
+    return server
+
+
+def collect_html_files(html_dir: str) -> list[str]:
+    """扫描 HTML 目录，返回所有 .html 文件名（排序）"""
+    files = sorted(
+        f for f in os.listdir(html_dir)
+        if f.endswith(".html")
+    )
+    print(f"  找到 {len(files)} 个 HTML 文件")
+    return files
 
 
 def clear_browser_startup_data(user_data_dir: str):
@@ -95,18 +122,6 @@ def clear_browser_startup_data(user_data_dir: str):
 
 
 # ==================== 工具函数 ====================
-
-def collect_unique_urls(tasks: list) -> list:
-    """从 v5.json 任务列表中收集所有唯一 URL（保持顺序）"""
-    seen = set()
-    urls = []
-    for task in tasks:
-        for url in task.get("open_url", []):
-            if url not in seen:
-                seen.add(url)
-                urls.append(url)
-    return urls
-
 
 def load_existing_cache(path: str) -> dict:
     """加载已有的 summary_cache.json"""
@@ -242,6 +257,7 @@ async def wait_for_summary_cached(sidebar_page, url: str, timeout: int = SUMMARY
 
 
 async def handle_login_if_needed(context):
+    return
     """首次运行时暂停让用户手动登录"""
     if not NEED_LOGIN:
         return
@@ -278,14 +294,17 @@ async def handle_login_if_needed(context):
 # ==================== 主流程 ====================
 
 async def main():
-    # 加载任务数据
-    with open(V5_JSON_PATH, "r", encoding="utf-8") as f:
-        tasks = json.load(f)
-    print(f"已加载 {len(tasks)} 个任务")
+    # 扫描 HTML 目录，获取所有本地 HTML 文件
+    print("扫描 HTML 文件...")
+    html_files = collect_html_files(HTML_DIR)
+    if not html_files:
+        print("没有找到 HTML 文件，退出")
+        return
+    local_base_url = f"http://127.0.0.1:{LOCAL_SERVER_PORT}"
 
-    # 收集唯一 URL
-    all_urls = collect_unique_urls(tasks)
-    print(f"共 {len(all_urls)} 个唯一 URL 需要处理")
+    # 启动本地 HTTP 服务器
+    print("\n启动本地 HTTP 服务器...")
+    server = start_local_server(HTML_DIR, LOCAL_SERVER_PORT)
 
     # 加载已有的 summary_cache.json
     cache_json = load_existing_cache(SUMMARY_CACHE_JSON_PATH)
@@ -309,7 +328,7 @@ async def main():
             channel="msedge",
             headless=False,
             args=[
-                # "--headless=new",
+                "--headless=new",
                 f"--disable-extensions-except={EXTENSION_PATH}",
                 f"--load-extension={EXTENSION_PATH}",
             ],
@@ -345,27 +364,26 @@ async def main():
             generated_count = 0
             failed_count = 0
 
-            for idx, url in enumerate(all_urls):
-                short_url = url[:80] + ("..." if len(url) > 80 else "")
-                print(f"\n[{idx + 1}/{len(all_urls)}] {short_url}")
+            for idx, filename in enumerate(html_files):
+                local_url = f"{local_base_url}/{filename}"
+                print(f"\n[{idx + 1}/{len(html_files)}] {filename}")
 
                 # Step 1: 检查 chrome.storage.local 中是否已有缓存
-                existing = await check_cached_summary(sidebar_page, url)
+                existing = await check_cached_summary(sidebar_page, local_url)
                 if existing:
                     print(f"  ✓ 已有缓存，跳过")
-                    # 同步到 summary_cache.json（如果 json 文件中没有）
-                    cache_key = SUMMARY_CACHE_PREFIX + url
+                    cache_key = SUMMARY_CACHE_PREFIX + local_url
                     if cache_key not in cache_json:
                         cache_json[cache_key] = existing
                         save_cache_json(SUMMARY_CACHE_JSON_PATH, cache_json)
                     cached_count += 1
                     continue
 
-                # Step 2: 打开网页，触发 content.js -> PAGE_LOADED -> summarizePage()
-                print(f"  打开网页...")
+                # Step 2: 打开本地网页，触发 content.js -> PAGE_LOADED -> summarizePage()
+                print(f"  打开本地网页: {local_url}")
                 content_page = await context.new_page()
                 try:
-                    await content_page.goto(url, timeout=PAGE_LOAD_TIMEOUT, wait_until="domcontentloaded")
+                    await content_page.goto(local_url, timeout=PAGE_LOAD_TIMEOUT, wait_until="domcontentloaded")
                     print(f"  页面加载完成，等待 content script 注入...")
                 except Exception as e:
                     print(f"  ✗ 页面加载失败: {type(e).__name__}: {e}")
@@ -381,7 +399,7 @@ async def main():
 
                 # Step 3: 轮询等待摘要生成完成
                 print(f"  等待摘要生成 (最长 {SUMMARY_TIMEOUT}s)...")
-                summary_data = await wait_for_summary_cached(sidebar_page, url, SUMMARY_TIMEOUT)
+                summary_data = await wait_for_summary_cached(sidebar_page, local_url, SUMMARY_TIMEOUT)
 
                 # Step 4: 关闭网页
                 try:
@@ -393,7 +411,7 @@ async def main():
                     print(f"  ✓ 摘要已生成 (长度: {len(summary_data.get('summary', ''))} chars)")
 
                     # 保存到 summary_cache.json
-                    cache_key = SUMMARY_CACHE_PREFIX + url
+                    cache_key = SUMMARY_CACHE_PREFIX + local_url
                     cache_json[cache_key] = summary_data
                     save_cache_json(SUMMARY_CACHE_JSON_PATH, cache_json)
                     generated_count += 1
@@ -401,14 +419,14 @@ async def main():
                     print(f"  ✗ 摘要生成超时")
                     failed_count += 1
 
-            # ==================== 最终导出全部缓存 ====================
-            print(f"\n{'=' * 60}")
-            print("导出全部 chrome.storage.local 摘要到 summary_cache.json ...")
-            all_summaries = await get_all_cached_summaries(sidebar_page)
-            for url, data in all_summaries.items():
-                cache_key = SUMMARY_CACHE_PREFIX + url
-                cache_json[cache_key] = data
-            save_cache_json(SUMMARY_CACHE_JSON_PATH, cache_json)
+            # # ==================== 最终导出全部缓存 ====================
+            # print(f"\n{'=' * 60}")
+            # print("导出全部 chrome.storage.local 摘要到 summary_cache.json ...")
+            # all_summaries = await get_all_cached_summaries(sidebar_page)
+            # for url, data in all_summaries.items():
+            #     cache_key = SUMMARY_CACHE_PREFIX + url
+            #     cache_json[cache_key] = data
+            # save_cache_json(SUMMARY_CACHE_JSON_PATH, cache_json)
 
             # ==================== 完成 ====================
             print(f"\n{'=' * 60}")
@@ -432,6 +450,8 @@ async def main():
             raise
         finally:
             await context.close()
+            server.shutdown()
+            print("  本地 HTTP 服务器已关闭")
 
 
 if __name__ == "__main__":

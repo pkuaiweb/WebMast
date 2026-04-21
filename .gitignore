@@ -332,3 +332,4 @@ src/build-info.json
 
 *.zip
 /test-profile
+files/html
