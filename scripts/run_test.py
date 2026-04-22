@@ -40,7 +40,7 @@ DATA_DIR = str(PROJECT_DIR.parent / "Master-Thesis" / "data")
 OUTPUT_DIR = str(PROJECT_DIR.parent / "Master-Thesis" / "data")
 USER_DATA_DIR = str(PROJECT_DIR / "test-profile")
 
-TASK_JSON_FILES = ["gitlab.json", "map.json", "reddit.json",  "wiki.json"]
+TASK_JSON_FILES = ["gitlab.json", "map.json", "reddit.json", "shopping.json", "wiki.json"]
 
 REPEAT_COUNT = 3                  # 每个任务重复次数
 PAGE_LOAD_TIMEOUT = 60000         # 页面加载超时 (ms)
@@ -393,7 +393,7 @@ async def main():
             channel="msedge",
             headless=False,          # 保持 False，通过 --headless=new 启用新 headless 模式（支持扩展）
             args=[
-                # "--headless=new",
+                "--headless=new",
                 f"--disable-extensions-except={EXTENSION_PATH}",
                 f"--load-extension={EXTENSION_PATH}",
             ],

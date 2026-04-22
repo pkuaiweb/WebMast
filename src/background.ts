@@ -17,9 +17,9 @@ console.log(`[Background] Service worker starting... (build: ${buildInfo.uid} @ 
 
 const SUMMARY_CACHE_PREFIX = "page_summary_";
 const PENDING_CACHE_PREFIX = "pending_page_";
-const DEFAULT_MODEL_ID = "Qwen3-8B-q4f16_1-MLC" // "Phi-3.5-mini-instruct-q4f16_1-MLC"// "Llama-3.2-1B-Instruct-q4f16_1-MLC"// "Llama-3.2-3B-Instruct-q4f32_1-MLC";
+const DEFAULT_MODEL_ID = "Qwen3-1.7B-q4f16_1-MLC" // "Phi-3.5-mini-instruct-q4f16_1-MLC"// "Llama-3.2-1B-Instruct-q4f16_1-MLC"// "Llama-3.2-3B-Instruct-q4f32_1-MLC";
 const MODEL_STORAGE_KEY = "selected_model_id";
-const USE_SUMMARY_CACHE = true; // 是否启用摘要缓存
+const USE_SUMMARY_CACHE = false; // 是否启用摘要缓存
 const DATA_FLOW_TYPE: number = 5; // 1: 直接拼接，2: content提取，3: summary提取，4: summary评估+回退，5: 子问题+content，6: 子问题+summary评估+回退
 let currentModelId = DEFAULT_MODEL_ID;
 
@@ -501,7 +501,7 @@ function buildMultiTabFinalPrompt(
         "Rules:",
         "- Use ONLY the information from the provided tabs. Do NOT use your own knowledge or make assumptions beyond the data.",
         "- When the question requires cross-referencing multiple tabs, look up values from one tab and compare against the other.",
-        "- If the provided tabs do not contain enough information to answer the question, say \"The provided tabs do not contain enough information to answer this question.\"",
+        // "- If the provided tabs do not contain enough information to answer the question, say \"The provided tabs do not contain enough information to answer this question.\"",
         "- Be concise. Do NOT repeat the same point.",
       ].join("\n")
     },
