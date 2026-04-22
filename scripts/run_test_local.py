@@ -409,10 +409,12 @@ async def main():
             user_data_dir=USER_DATA_DIR,
             channel="msedge",
             headless=False,
+            locale="en-US",
             args=[
                 # "--headless=new",
                 f"--disable-extensions-except={EXTENSION_PATH}",
                 f"--load-extension={EXTENSION_PATH}",
+                "--lang=en-US",
             ],
             timeout=60000,
             viewport={"width": 1280, "height": 900},

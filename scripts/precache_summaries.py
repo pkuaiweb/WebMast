@@ -1,12 +1,17 @@
 """
 WebMast Summary Pre-Cache Script
 ==================================
-预缓存脚本：为 v5.json 中所有 URL 生成摘要缓存，以加速后续 run_v5_test.py 测试。
+预缓存脚本：为所有 URL 生成摘要缓存，以加速后续测试。
+
+支持两种模式：
+  local  - 打开本地 HTML 文件（通过本地 HTTP 服务器），进行预缓存
+  remote - 读取 Master-Thesis/data/ 中的任务 JSON，提取并去重所有 URL，
+           逐一打开远程网页，调用 WebMast 进行摘要缓存
 
 流程：
 1. 启动 Edge 浏览器（加载 WebMast 扩展）
 2. 等待 LLM 引擎就绪
-3. 收集 v5.json 中所有唯一 URL
+3. 根据模式收集 URL 列表
 4. 对每个 URL：
    a. 通过扩展检查 chrome.storage.local 中是否已有摘要缓存
    b. 如果有，跳过
@@ -19,15 +24,23 @@ WebMast Summary Pre-Cache Script
 使用方式:
     pip install playwright
     playwright install chromium
+
+    # 本地 HTML 模式（默认）
     python scripts/precache_summaries.py
+    python scripts/precache_summaries.py --mode local
+
+    # 远程 URL 模式
+    python scripts/precache_summaries.py --mode remote
 
 注意：
     - 首次运行时 WebMast 需要下载模型，可能需要几分钟
     - 使用持久化浏览器 profile (test-profile/)，缓存会保留
     - 生成的 chrome.storage.local 缓存在 test-profile/ 中持久化，
       后续 run_v5_test.py 启动时可直接利用
+    - remote 模式需要远程服务器可达
 """
 
+import argparse
 import asyncio
 import json
 import os
@@ -52,6 +65,10 @@ BACKGROUND_TS_PATH = str(PROJECT_DIR / "src" / "background.ts")
 
 HTML_DIR = str(PROJECT_DIR / "files" / "html")
 LOCAL_SERVER_PORT = 8765          # 本地 HTTP 服务器端口
+
+# remote 模式：任务 JSON 所在目录
+DATA_DIR = str(PROJECT_DIR.parent / "Master-Thesis" / "data")
+TASK_JSON_FILES = ["gitlab.json", "map.json", "reddit.json", "shopping.json", "wiki.json"]
 
 PAGE_LOAD_TIMEOUT = 60000          # 页面加载超时 (ms)
 ENGINE_READY_TIMEOUT = 1200000     # 引擎加载超时 (ms), 首次下载模型较慢
@@ -81,6 +98,36 @@ def collect_html_files(html_dir: str) -> list[str]:
     )
     print(f"  找到 {len(files)} 个 HTML 文件")
     return files
+
+
+def collect_remote_urls(data_dir: str, task_files: list[str]) -> list[str]:
+    """从 data/ 目录的任务 JSON 文件中提取所有唯一 URL（保持首次出现顺序）"""
+    seen = set()
+    urls = []
+    for filename in task_files:
+        filepath = os.path.join(data_dir, filename)
+        if not os.path.exists(filepath):
+            print(f"  警告: 文件不存在，跳过: {filepath}")
+            continue
+        with open(filepath, "r", encoding="utf-8") as f:
+            tasks = json.load(f)
+        file_count = 0
+        for task in tasks:
+            # 收集 open_url 列表中的所有 URL
+            for url in task.get("open_url", []):
+                if url not in seen:
+                    seen.add(url)
+                    urls.append(url)
+                    file_count += 1
+            # 收集 start_url
+            start_url = task.get("start_url", "")
+            if start_url and start_url not in seen:
+                seen.add(start_url)
+                urls.append(start_url)
+                file_count += 1
+        print(f"  {filename}: 新增 {file_count} 个唯一 URL")
+    print(f"  共提取 {len(urls)} 个唯一 URL（来自 {len(task_files)} 个文件）")
+    return urls
 
 
 def clear_browser_startup_data(user_data_dir: str):
@@ -293,18 +340,45 @@ async def handle_login_if_needed(context):
 
 # ==================== 主流程 ====================
 
-async def main():
-    # 扫描 HTML 目录，获取所有本地 HTML 文件
-    print("扫描 HTML 文件...")
-    html_files = collect_html_files(HTML_DIR)
-    if not html_files:
-        print("没有找到 HTML 文件，退出")
-        return
-    local_base_url = f"http://127.0.0.1:{LOCAL_SERVER_PORT}"
+def parse_args():
+    parser = argparse.ArgumentParser(description="WebMast Summary Pre-Cache Script")
+    parser.add_argument(
+        "--mode", choices=["local", "remote"], default="local",
+        help="预缓存模式: local=本地 HTML 文件, remote=远程 URL (默认: local)"
+    )
+    return parser.parse_args()
 
-    # 启动本地 HTTP 服务器
-    print("\n启动本地 HTTP 服务器...")
-    server = start_local_server(HTML_DIR, LOCAL_SERVER_PORT)
+
+async def main():
+    args = parse_args()
+    mode = args.mode
+    print(f"预缓存模式: {mode}")
+
+    server = None  # 本地 HTTP 服务器（仅 local 模式使用）
+
+    if mode == "local":
+        # ===== local 模式：扫描本地 HTML 文件 =====
+        print("\n扫描 HTML 文件...")
+        html_files = collect_html_files(HTML_DIR)
+        if not html_files:
+            print("没有找到 HTML 文件，退出")
+            return
+        local_base_url = f"http://127.0.0.1:{LOCAL_SERVER_PORT}"
+        url_list = [f"{local_base_url}/{f}" for f in html_files]
+        display_names = html_files  # 用于打印的可读名称
+
+        # 启动本地 HTTP 服务器
+        print("\n启动本地 HTTP 服务器...")
+        server = start_local_server(HTML_DIR, LOCAL_SERVER_PORT)
+
+    else:
+        # ===== remote 模式：从 data/ JSON 文件收集 URL =====
+        print(f"\n从 {DATA_DIR} 收集远程 URL...")
+        url_list = collect_remote_urls(DATA_DIR, TASK_JSON_FILES)
+        if not url_list:
+            print("没有找到 URL，退出")
+            return
+        display_names = url_list  # 远程模式直接显示 URL
 
     # 加载已有的 summary_cache.json
     cache_json = load_existing_cache(SUMMARY_CACHE_JSON_PATH)
@@ -327,10 +401,12 @@ async def main():
             user_data_dir=USER_DATA_DIR,
             channel="msedge",
             headless=False,
+            locale="en-US",
             args=[
                 "--headless=new",
                 f"--disable-extensions-except={EXTENSION_PATH}",
                 f"--load-extension={EXTENSION_PATH}",
+                "--lang=en-US",
             ],
             timeout=60000,
             viewport={"width": 1280, "height": 900},
@@ -364,26 +440,27 @@ async def main():
             generated_count = 0
             failed_count = 0
 
-            for idx, filename in enumerate(html_files):
-                local_url = f"{local_base_url}/{filename}"
-                print(f"\n[{idx + 1}/{len(html_files)}] {filename}")
+            for idx, url in enumerate(url_list):
+                display = display_names[idx]
+                print(f"\n[{idx + 1}/{len(url_list)}] {display}")
 
                 # Step 1: 检查 chrome.storage.local 中是否已有缓存
-                existing = await check_cached_summary(sidebar_page, local_url)
+                existing = await check_cached_summary(sidebar_page, url)
                 if existing:
                     print(f"  ✓ 已有缓存，跳过")
-                    cache_key = SUMMARY_CACHE_PREFIX + local_url
+                    cache_key = SUMMARY_CACHE_PREFIX + url
                     if cache_key not in cache_json:
                         cache_json[cache_key] = existing
                         save_cache_json(SUMMARY_CACHE_JSON_PATH, cache_json)
                     cached_count += 1
                     continue
 
-                # Step 2: 打开本地网页，触发 content.js -> PAGE_LOADED -> summarizePage()
-                print(f"  打开本地网页: {local_url}")
+                # Step 2: 打开网页，触发 content.js -> PAGE_LOADED -> summarizePage()
+                print(f"  打开网页: {url}")
                 content_page = await context.new_page()
                 try:
-                    await content_page.goto(local_url, timeout=PAGE_LOAD_TIMEOUT, wait_until="domcontentloaded")
+                    await content_page.goto(url, timeout=PAGE_LOAD_TIMEOUT, wait_until="domcontentloaded")
+                    url=content_page.url  # 更新为实际加载后的 URL（处理重定向）
                     print(f"  页面加载完成，等待 content script 注入...")
                 except Exception as e:
                     print(f"  ✗ 页面加载失败: {type(e).__name__}: {e}")
@@ -399,7 +476,7 @@ async def main():
 
                 # Step 3: 轮询等待摘要生成完成
                 print(f"  等待摘要生成 (最长 {SUMMARY_TIMEOUT}s)...")
-                summary_data = await wait_for_summary_cached(sidebar_page, local_url, SUMMARY_TIMEOUT)
+                summary_data = await wait_for_summary_cached(sidebar_page, url, SUMMARY_TIMEOUT)
 
                 # Step 4: 关闭网页
                 try:
@@ -411,7 +488,7 @@ async def main():
                     print(f"  ✓ 摘要已生成 (长度: {len(summary_data.get('summary', ''))} chars)")
 
                     # 保存到 summary_cache.json
-                    cache_key = SUMMARY_CACHE_PREFIX + local_url
+                    cache_key = SUMMARY_CACHE_PREFIX + url
                     cache_json[cache_key] = summary_data
                     save_cache_json(SUMMARY_CACHE_JSON_PATH, cache_json)
                     generated_count += 1
@@ -450,8 +527,9 @@ async def main():
             raise
         finally:
             await context.close()
-            server.shutdown()
-            print("  本地 HTTP 服务器已关闭")
+            if server:
+                server.shutdown()
+                print("  本地 HTTP 服务器已关闭")
 
 
 if __name__ == "__main__":

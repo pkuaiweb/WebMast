@@ -37,7 +37,7 @@ PROJECT_DIR = SCRIPT_DIR.parent  # WebMast/
 
 EXTENSION_PATH = str(PROJECT_DIR / "dist")
 DATA_DIR = str(PROJECT_DIR.parent / "Master-Thesis" / "data")
-OUTPUT_DIR = str(PROJECT_DIR.parent / "Master-Thesis" / "data")
+OUTPUT_DIR = str(PROJECT_DIR.parent / "Master-Thesis" / "result")
 USER_DATA_DIR = str(PROJECT_DIR / "test-profile")
 
 TASK_JSON_FILES = ["gitlab.json", "map.json", "reddit.json", "shopping.json", "wiki.json"]
@@ -392,10 +392,12 @@ async def main():
             user_data_dir=USER_DATA_DIR,
             channel="msedge",
             headless=False,          # 保持 False，通过 --headless=new 启用新 headless 模式（支持扩展）
+            locale="en-US",
             args=[
                 "--headless=new",
                 f"--disable-extensions-except={EXTENSION_PATH}",
                 f"--load-extension={EXTENSION_PATH}",
+                "--lang=en-US",
             ],
             timeout=60000,
             viewport={"width": 1280, "height": 900},
