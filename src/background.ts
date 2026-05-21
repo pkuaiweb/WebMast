@@ -17,7 +17,7 @@ console.log(`[Background] Service worker starting... (build: ${buildInfo.uid} @ 
 
 const SUMMARY_CACHE_PREFIX = "page_summary_";
 const PENDING_CACHE_PREFIX = "pending_page_";
-const DEFAULT_MODEL_ID = "Qwen3-1.7B-q4f16_1-MLC" // "Phi-3.5-mini-instruct-q4f16_1-MLC"// "Llama-3.2-1B-Instruct-q4f16_1-MLC"// "Llama-3.2-3B-Instruct-q4f32_1-MLC";
+const DEFAULT_MODEL_ID = "Qwen3.5-2B-q4f16_1-MLC" // "Phi-3.5-mini-instruct-q4f16_1-MLC"// "Llama-3.2-1B-Instruct-q4f16_1-MLC"// "Llama-3.2-3B-Instruct-q4f32_1-MLC";
 const MODEL_STORAGE_KEY = "selected_model_id";
 const USE_SUMMARY_CACHE = false; // 是否启用摘要缓存
 const DATA_FLOW_TYPE: number = 5; // 1: 直接拼接，2: content提取，3: summary提取，4: summary评估+回退，5: 子问题+content，6: 子问题+summary评估+回退
@@ -346,19 +346,8 @@ function parseSummaryResponse(response: string): SummaryEvaluationResult {
   return { sufficient: isSufficient, answer };
 }
 
-// 如果模型是 Qwen3，在最后一条 user 消息末尾追加 /nothink
-function appendNothinkIfQwen3(messages: ChatMessage[]): ChatMessage[] {
-  if (!currentModelId.toLowerCase().includes("qwen3")) return messages;
-  const result = messages.map(m => ({ ...m }));
-  for (let i = result.length - 1; i >= 0; i--) {
-    if (result[i].role === "user") {
-      result[i].content += " /nothink /no_think";
-      break;
-    }
-    // result[i].content="/no_think "+result[i].content+" /no_think";
-  }
-  return result;
-}
+// [已移除] appendNothinkIfQwen3 —— 改为在 offscreen.ts 的 generateCore 中
+// 使用 web-llm 官方 API: extra_body: { enable_thinking: false } 关闭 Qwen3 think 模式
 
 // 调用 offscreen 进行静默 chat（中间处理，不更新 UI）
 // activeRequests: 可选，传入端口关联的请求集合，用于 disconnect 时取消
@@ -366,7 +355,6 @@ async function silentChat(
   messages: ChatMessage[],
   port: chrome.runtime.Port | null = null,
 ): Promise<string> {
-  messages = appendNothinkIfQwen3(messages);
   return new Promise((resolve, reject) => {
     const requestId = `silent_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
@@ -389,10 +377,14 @@ async function silentChat(
       if (chrome.runtime.lastError) {
         reject(new Error(chrome.runtime.lastError.message));
       } else if (response?.success) {
-        if (response.content?.includes("</think>")) {
-          response.content = response.content.split("</think>")[1].trim();
+        let content = response.content || "";
+        // 移除 <think>...</think> 思考内容
+        content = content.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+        // 兜底：如果只有未闭合的 </think> 标签，取其后内容
+        if (content.includes("</think>")) {
+          content = content.split("</think>").pop()!.trim();
         }
-        resolve(response.content || "");
+        resolve(content);
       } else {
         reject(new Error(response?.error || "Unknown error"));
       }
@@ -1049,7 +1041,6 @@ async function ensureEngineReadyForPort(port: chrome.runtime.Port): Promise<bool
  */
 async function startStreaming(port: chrome.runtime.Port, messages: ChatMessage[]): Promise<void> {
   // if (!await ensureEngineReadyForPort(port)) return;
-  messages = appendNothinkIfQwen3(messages);
 
   const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 

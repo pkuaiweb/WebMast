@@ -211,6 +211,14 @@ async function generateCore(
 
   activeRequests.set(requestId, { aborted: false });
 
+  // Qwen3/3.5 模型：通过 web-llm 的 extra_body API 关闭 think 模式
+  if (currentModelId.toLowerCase().includes("qwen3")) {
+    extraCreateParams = {
+      ...extraCreateParams,
+      extra_body: { enable_thinking: false },
+    };
+  }
+
   let content = "";
   let usage: any = null;
   const completion = await engine!.chat.completions.create({
